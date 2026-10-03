@@ -1,6 +1,7 @@
 mod git;
 mod input;
 mod pty;
+mod review;
 mod ui;
 
 use std::io::{self, IsTerminal, Read, Write};
