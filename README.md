@@ -10,11 +10,28 @@ The prefix is `Ctrl-b`, then:
 
 | Key | Action |
 | --- | --- |
+| `g` | Open or close the review view |
 | `q` | Quit spindle (kills the shell) |
 | `n`, `s` | Placeholders for new workspace and split; they do nothing yet |
 | `Ctrl-b` | Send a literal `Ctrl-b` to the shell |
 
 Any other key after the prefix is passed to the shell along with the `Ctrl-b`.
+
+## Reviewing changes
+
+`Ctrl-b g` swaps the shell pane for a review of uncommitted changes: everything that differs from `HEAD`, staged and unstaged together. On the left is a tree of the whole repo (gitignored paths hidden) with changed files marked `M` modified, `A` added, `D` deleted, `R` renamed or `?` untracked. Folders containing changes start expanded. On the right is the selected file's diff, or its contents if it hasn't changed. The shell keeps running underneath.
+
+| Key | Action |
+| --- | --- |
+| `j`/`k` or arrows | Move through the tree |
+| `l`/`h` or arrows | Expand a folder / collapse it or jump to its parent |
+| `Enter` or `o` | Toggle a folder |
+| `g`/`G` | First / last entry |
+| `J`/`K`, `Space`, PgDn/PgUp | Scroll the diff or file |
+| `r` | Reload from git |
+| `q` or `Esc` | Back to the shell |
+
+The review shows the repo spindle was launched in, not wherever the shell has since `cd`'d to.
 
 ## Try it
 
