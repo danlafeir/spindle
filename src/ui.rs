@@ -356,4 +356,23 @@ mod tests {
         assert!(text.contains("evil"));
         assert!(!text.contains('\x1b'));
     }
+
+    #[test]
+    fn hostile_file_names_never_reach_the_buffer_as_escapes() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::git::tests::git(tmp.path(), &["init", "-q"]);
+        crate::git::tests::write(tmp.path(), "evil\x1b]0;pwned\x07.txt", "x\n");
+        let review = Review::open(tmp.path()).unwrap();
+        assert!(review.selected().unwrap().name().contains("pwned"));
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        let parser = vt100::Parser::new(1, 1, 0);
+        terminal
+            .draw(|f| draw(f, parser.screen(), &View::Review(Box::new(review))))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let text: String = (0..10).map(|y| row(buf, y)).collect();
+        assert!(text.contains("pwned"));
+        assert!(!text.contains('\x1b') && !text.contains('\x07'), "{text:?}");
+    }
 }

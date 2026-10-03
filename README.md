@@ -2,7 +2,7 @@
 
 A keyboard-first, agent-aware terminal multiplexer: real PTY panes, a sidebar of workspaces and running agents, a quiet sound when an agent needs attention, and a built-in git changeset viewer.
 
-Status: early development. Today spindle shows a layout mock: a left sidebar with the menu on top, then workspaces and agents, and your `$SHELL` (falling back to `/bin/sh`) running in a pane on the right. The sidebar contents are static placeholders, not real workspaces or detected agents. The session ends when the shell exits.
+Status: early development. Today spindle has a working review view for git changes (below), inside a layout mock: a left sidebar with the menu on top, then workspaces and agents, and your `$SHELL` (falling back to `/bin/sh`) running in a pane on the right. The sidebar contents are static placeholders, not real workspaces or detected agents. The session ends when the shell exits.
 
 ## Keys
 
