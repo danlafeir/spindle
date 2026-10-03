@@ -18,7 +18,7 @@ enum Event {
     Output(Vec<u8>),
     Exited,
     Resize,
-    Quit,
+    Keys(Vec<u8>),
 }
 
 struct RestoreTerminal;
@@ -83,27 +83,29 @@ fn run() -> Result<ExitCode> {
         let _ = output_tx.send(Event::Exited);
     });
 
+    let (shell_tx, shell_rx) = mpsc::channel::<Vec<u8>>();
+    // Writes to the PTY block while the shell isn't reading, so they get their own thread
+    // rather than stalling rendering. It ends when the main loop drops shell_tx.
+    thread::spawn(move || {
+        for bytes in shell_rx {
+            if writer
+                .write_all(&bytes)
+                .and_then(|_| writer.flush())
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+
     let input_tx = tx.clone();
     // Blocks on stdin forever so it can't be joined; it ends with the process.
     thread::spawn(move || {
         let mut stdin = io::stdin().lock();
-        let mut input = input::Input::default();
         let mut buf = [0u8; 1024];
         while let Ok(n @ 1..) = stdin.read(&mut buf) {
-            match input.feed(&buf[..n]) {
-                input::Action::Quit => {
-                    let _ = input_tx.send(Event::Quit);
-                    return;
-                }
-                input::Action::Forward(bytes) => {
-                    if writer
-                        .write_all(&bytes)
-                        .and_then(|_| writer.flush())
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
+            if input_tx.send(Event::Keys(buf[..n].to_vec())).is_err() {
+                return;
             }
         }
     });
@@ -118,6 +120,7 @@ fn run() -> Result<ExitCode> {
         }
     });
 
+    let mut input = input::Input::default();
     term.draw(|f| ui::draw(f, parser.screen()))?;
     for event in &rx {
         match event {
@@ -130,10 +133,19 @@ fn run() -> Result<ExitCode> {
                 master.resize(pty_size(inner))?;
             }
             Event::Exited => break,
-            Event::Quit => {
-                child.kill()?;
-                child.wait()?;
-                return Ok(ExitCode::SUCCESS);
+            Event::Keys(bytes) => {
+                for action in input.feed(&bytes) {
+                    match action {
+                        input::Action::Bytes(bytes) => {
+                            let _ = shell_tx.send(bytes);
+                        }
+                        input::Action::Quit => {
+                            child.kill()?;
+                            child.wait()?;
+                            return Ok(ExitCode::SUCCESS);
+                        }
+                    }
+                }
             }
         }
         term.draw(|f| ui::draw(f, parser.screen()))?;

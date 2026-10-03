@@ -2,39 +2,54 @@ const PREFIX: u8 = 0x02; // Ctrl-b
 
 #[derive(Debug, PartialEq)]
 pub enum Action {
-    Forward(Vec<u8>),
+    Bytes(Vec<u8>),
     Quit,
 }
 
-/// Splits keyboard bytes into what goes to the shell and spindle's own commands. The prefix
-/// state lives across calls because Ctrl-b and the key after it can arrive in separate reads.
+/// Splits keyboard bytes into plain input and spindle's own commands, in the order they were
+/// typed. The prefix state lives across calls because Ctrl-b and the key after it can arrive in
+/// separate reads.
 #[derive(Default)]
 pub struct Input {
     prefixed: bool,
 }
 
 impl Input {
-    pub fn feed(&mut self, bytes: &[u8]) -> Action {
-        let mut forward = Vec::with_capacity(bytes.len());
+    pub fn feed(&mut self, bytes: &[u8]) -> Vec<Action> {
+        let mut actions = Vec::new();
+        let mut plain = Vec::with_capacity(bytes.len());
         for &b in bytes {
             if !self.prefixed {
                 if b == PREFIX {
                     self.prefixed = true;
                 } else {
-                    forward.push(b);
+                    plain.push(b);
                 }
                 continue;
             }
             self.prefixed = false;
-            match b {
-                b'q' => return Action::Quit,
+            let command = match b {
+                b'q' => Action::Quit,
                 // Advertised in the menu but not implemented yet; swallowed so they don't leak to the shell.
-                b'n' | b's' => {}
-                PREFIX => forward.push(PREFIX),
-                other => forward.extend([PREFIX, other]),
+                b'n' | b's' => continue,
+                PREFIX => {
+                    plain.push(PREFIX);
+                    continue;
+                }
+                other => {
+                    plain.extend([PREFIX, other]);
+                    continue;
+                }
+            };
+            if !plain.is_empty() {
+                actions.push(Action::Bytes(std::mem::take(&mut plain)));
             }
+            actions.push(command);
         }
-        Action::Forward(forward)
+        if !plain.is_empty() {
+            actions.push(Action::Bytes(plain));
+        }
+        actions
     }
 }
 
@@ -46,22 +61,34 @@ mod tests {
     fn plain_bytes_pass_through() {
         assert_eq!(
             Input::default().feed(b"ls\r"),
-            Action::Forward(b"ls\r".to_vec())
+            vec![Action::Bytes(b"ls\r".to_vec())]
         );
     }
 
     #[test]
     fn prefix_q_quits_even_when_split_across_reads() {
         let mut input = Input::default();
-        assert_eq!(input.feed(&[PREFIX]), Action::Forward(vec![]));
-        assert_eq!(input.feed(b"q"), Action::Quit);
+        assert_eq!(input.feed(&[PREFIX]), vec![]);
+        assert_eq!(input.feed(b"q"), vec![Action::Quit]);
+    }
+
+    #[test]
+    fn bytes_and_commands_keep_their_order() {
+        assert_eq!(
+            Input::default().feed(&[b'l', b's', PREFIX, b'q', b'x']),
+            vec![
+                Action::Bytes(b"ls".to_vec()),
+                Action::Quit,
+                Action::Bytes(b"x".to_vec())
+            ]
+        );
     }
 
     #[test]
     fn double_prefix_sends_one_literal_ctrl_b() {
         assert_eq!(
             Input::default().feed(&[PREFIX, PREFIX]),
-            Action::Forward(vec![PREFIX])
+            vec![Action::Bytes(vec![PREFIX])]
         );
     }
 
@@ -69,15 +96,12 @@ mod tests {
     fn unbound_key_after_prefix_forwards_both() {
         assert_eq!(
             Input::default().feed(&[PREFIX, b'x', b'y']),
-            Action::Forward(vec![PREFIX, b'x', b'y'])
+            vec![Action::Bytes(vec![PREFIX, b'x', b'y'])]
         );
     }
 
     #[test]
     fn placeholder_commands_are_swallowed() {
-        assert_eq!(
-            Input::default().feed(&[PREFIX, b'n', PREFIX, b's']),
-            Action::Forward(vec![])
-        );
+        assert_eq!(Input::default().feed(&[PREFIX, b'n', PREFIX, b's']), vec![]);
     }
 }
