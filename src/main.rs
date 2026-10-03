@@ -122,24 +122,54 @@ fn run() -> Result<ExitCode> {
         }
     });
 
+    let launch_dir = std::env::current_dir()?;
+    let mut pane_inner = inner;
+    let mut view = ui::View::Shell;
     let mut input = input::Input::default();
-    term.draw(|f| ui::draw(f, parser.screen()))?;
+    term.draw(|f| ui::draw(f, parser.screen(), &view))?;
     for event in &rx {
         match event {
             Event::Output(bytes) => parser.process(&bytes),
             Event::Resize => {
                 term.autoresize()?;
                 let size = term.size()?;
-                let inner = ui::layout(Rect::new(0, 0, size.width, size.height)).pane_inner;
-                parser.screen_mut().set_size(inner.height, inner.width);
-                master.resize(pty_size(inner))?;
+                pane_inner = ui::layout(Rect::new(0, 0, size.width, size.height)).pane_inner;
+                parser
+                    .screen_mut()
+                    .set_size(pane_inner.height, pane_inner.width);
+                master.resize(pty_size(pane_inner))?;
             }
             Event::Exited => break,
             Event::Keys(bytes) => {
                 for action in input.feed(&bytes) {
                     match action {
-                        input::Action::Bytes(bytes) => {
-                            let _ = shell_tx.send(bytes);
+                        input::Action::Bytes(bytes) => match &mut view {
+                            ui::View::Shell => {
+                                let _ = shell_tx.send(bytes);
+                            }
+                            ui::View::Review(review) => {
+                                let page = ui::review_page(pane_inner);
+                                let closed = review::parse_keys(&bytes).into_iter().any(|key| {
+                                    matches!(review.handle(key, page), review::Outcome::Close)
+                                });
+                                if closed {
+                                    view = ui::View::Shell;
+                                }
+                            }
+                            ui::View::Unavailable(_) => {
+                                if review::parse_keys(&bytes).contains(&review::Key::Close) {
+                                    view = ui::View::Shell;
+                                }
+                            }
+                        },
+                        input::Action::ToggleReview => {
+                            view = match view {
+                                ui::View::Shell => match review::Review::open(&launch_dir) {
+                                    Ok(review) => ui::View::Review(Box::new(review)),
+                                    Err(e) => ui::View::Unavailable(format!("{e:#}")),
+                                },
+                                _ => ui::View::Shell,
+                            };
                         }
                         input::Action::Quit => {
                             child.kill()?;
@@ -150,7 +180,7 @@ fn run() -> Result<ExitCode> {
                 }
             }
         }
-        term.draw(|f| ui::draw(f, parser.screen()))?;
+        term.draw(|f| ui::draw(f, parser.screen(), &view))?;
     }
 
     let status = child.wait()?;

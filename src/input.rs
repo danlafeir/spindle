@@ -4,6 +4,7 @@ const PREFIX: u8 = 0x02; // Ctrl-b
 pub enum Action {
     Bytes(Vec<u8>),
     Quit,
+    ToggleReview,
 }
 
 /// Splits keyboard bytes into plain input and spindle's own commands, in the order they were
@@ -30,6 +31,7 @@ impl Input {
             self.prefixed = false;
             let command = match b {
                 b'q' => Action::Quit,
+                b'g' => Action::ToggleReview,
                 // Advertised in the menu but not implemented yet; swallowed so they don't leak to the shell.
                 b'n' | b's' => continue,
                 PREFIX => {
@@ -81,6 +83,14 @@ mod tests {
                 Action::Quit,
                 Action::Bytes(b"x".to_vec())
             ]
+        );
+    }
+
+    #[test]
+    fn prefix_g_toggles_review() {
+        assert_eq!(
+            Input::default().feed(&[PREFIX, b'g', b'j']),
+            vec![Action::ToggleReview, Action::Bytes(b"j".to_vec())]
         );
     }
 
