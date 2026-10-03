@@ -1,27 +1,31 @@
+mod input;
 mod pty;
+mod ui;
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
+use std::sync::mpsc;
 use std::thread;
 
 use anyhow::{Result, bail};
 use crossterm::terminal;
 use portable_pty::{CommandBuilder, PtySize};
+use ratatui::layout::Rect;
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 
-struct RawMode;
-
-impl RawMode {
-    fn enable() -> io::Result<Self> {
-        terminal::enable_raw_mode()?;
-        Ok(RawMode)
-    }
+enum Event {
+    Output(Vec<u8>),
+    Exited,
+    Resize,
+    Quit,
 }
 
-impl Drop for RawMode {
+struct RestoreTerminal;
+
+impl Drop for RestoreTerminal {
     fn drop(&mut self) {
-        let _ = terminal::disable_raw_mode();
+        ratatui::restore();
     }
 }
 
@@ -35,34 +39,106 @@ fn main() -> ExitCode {
     }
 }
 
+fn pty_size(area: Rect) -> PtySize {
+    PtySize {
+        rows: area.height,
+        cols: area.width,
+        ..Default::default()
+    }
+}
+
 fn run() -> Result<ExitCode> {
     if !io::stdin().is_terminal() {
         bail!("stdin is not a terminal");
     }
 
     let (cols, rows) = terminal::size()?;
+    let inner = ui::layout(Rect::new(0, 0, cols, rows)).pane_inner;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let mut cmd = CommandBuilder::new(shell);
     cmd.cwd(std::env::current_dir()?);
-    let pty::Pane { master, mut child, mut reader, mut writer } =
-        pty::spawn(cmd, PtySize { rows, cols, ..Default::default() })?;
+    // vt100 is the emulator now, so advertise what it understands rather than the outer terminal.
+    cmd.env("TERM", "xterm-256color");
+    let pty::Pane {
+        master,
+        mut child,
+        mut reader,
+        mut writer,
+    } = pty::spawn(cmd, pty_size(inner))?;
+    let mut parser = vt100::Parser::new(inner.height, inner.width, 0);
 
-    let _raw = RawMode::enable()?;
+    let mut term = ratatui::try_init()?;
+    let _restore = RestoreTerminal;
+    let (tx, rx) = mpsc::channel();
 
-    // Blocks on stdin forever so it can't be joined; it ends with the process once the shell exits.
-    thread::spawn(move || pty::pump(&mut io::stdin().lock(), &mut writer));
+    let output_tx = tx.clone();
+    thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        // Linux reports a hung-up PTY master as EIO rather than EOF, so any read error means exit.
+        while let Ok(n @ 1..) = reader.read(&mut buf) {
+            if output_tx.send(Event::Output(buf[..n].to_vec())).is_err() {
+                return;
+            }
+        }
+        let _ = output_tx.send(Event::Exited);
+    });
+
+    let input_tx = tx.clone();
+    // Blocks on stdin forever so it can't be joined; it ends with the process.
+    thread::spawn(move || {
+        let mut stdin = io::stdin().lock();
+        let mut input = input::Input::default();
+        let mut buf = [0u8; 1024];
+        while let Ok(n @ 1..) = stdin.read(&mut buf) {
+            match input.feed(&buf[..n]) {
+                input::Action::Quit => {
+                    let _ = input_tx.send(Event::Quit);
+                    return;
+                }
+                input::Action::Forward(bytes) => {
+                    if writer
+                        .write_all(&bytes)
+                        .and_then(|_| writer.flush())
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    });
 
     let mut winch = Signals::new([SIGWINCH])?;
     // Waits on signals forever; like the stdin thread, it ends with the process.
     thread::spawn(move || {
         for _ in winch.forever() {
-            if let Ok((cols, rows)) = terminal::size() {
-                let _ = master.resize(PtySize { rows, cols, ..Default::default() });
+            if tx.send(Event::Resize).is_err() {
+                return;
             }
         }
     });
 
-    pty::pump(&mut reader, &mut io::stdout().lock())?;
+    term.draw(|f| ui::draw(f, parser.screen()))?;
+    for event in &rx {
+        match event {
+            Event::Output(bytes) => parser.process(&bytes),
+            Event::Resize => {
+                term.autoresize()?;
+                let size = term.size()?;
+                let inner = ui::layout(Rect::new(0, 0, size.width, size.height)).pane_inner;
+                parser.screen_mut().set_size(inner.height, inner.width);
+                master.resize(pty_size(inner))?;
+            }
+            Event::Exited => break,
+            Event::Quit => {
+                child.kill()?;
+                child.wait()?;
+                return Ok(ExitCode::SUCCESS);
+            }
+        }
+        term.draw(|f| ui::draw(f, parser.screen()))?;
+    }
+
     let status = child.wait()?;
     Ok(ExitCode::from(status.exit_code().min(255) as u8))
 }

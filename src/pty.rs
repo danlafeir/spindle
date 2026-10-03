@@ -1,4 +1,4 @@
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -17,21 +17,12 @@ pub fn spawn(cmd: CommandBuilder, size: PtySize) -> Result<Pane> {
     drop(pair.slave);
     let reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
-    Ok(Pane { master: pair.master, child, reader, writer })
-}
-
-/// Copies until the reader side ends. Linux reports a hung-up PTY master as EIO rather than
-/// EOF, so any read error is treated as end of stream; write errors are returned.
-pub fn pump(reader: &mut impl Read, writer: &mut impl Write) -> io::Result<()> {
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = match reader.read(&mut buf) {
-            Ok(0) | Err(_) => return Ok(()),
-            Ok(n) => n,
-        };
-        writer.write_all(&buf[..n])?;
-        writer.flush()?;
-    }
+    Ok(Pane {
+        master: pair.master,
+        child,
+        reader,
+        writer,
+    })
 }
 
 #[cfg(test)]
@@ -45,13 +36,22 @@ mod tests {
     fn output_passes_through_and_ends_when_child_exits() {
         let mut cmd = CommandBuilder::new("/bin/sh");
         cmd.args(["-c", "echo hi"]);
-        let mut pane = spawn(cmd, PtySize { rows: 24, cols: 80, ..Default::default() }).unwrap();
+        let mut pane = spawn(
+            cmd,
+            PtySize {
+                rows: 24,
+                cols: 80,
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let (tx, rx) = mpsc::channel();
         let mut reader = pane.reader;
         thread::spawn(move || {
             let mut out = Vec::new();
-            pump(&mut reader, &mut out).unwrap();
+            // A hung-up master reads as EOF on macOS but EIO on Linux; either ends the stream.
+            let _ = reader.read_to_end(&mut out);
             tx.send(out).unwrap();
         });
         let out = rx
