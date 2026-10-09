@@ -1,5 +1,11 @@
 const PREFIX: u8 = 0x02; // Ctrl-b
 const SGR_MOUSE: &[u8] = b"\x1b[<";
+// Real reports are at most about 20 bytes; anything longer without a final byte is garbage.
+const MAX_MOUSE_REPORT: usize = 32;
+
+/// How long a trailing ESC or `ESC [` waits for the rest of a mouse report before it's taken
+/// as typed keys. Terminals write a report in one go, so this only has to cover a read split.
+pub const ESC_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
 
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
@@ -146,7 +152,7 @@ fn parse_mouse(bytes: &[u8]) -> Option<(usize, Option<Mouse>)> {
 #[derive(Default)]
 pub struct Input {
     prefixed: bool,
-    /// The start of a mouse report whose remainder hasn't been read yet.
+    /// The start of a possible mouse report whose remainder hasn't been read yet.
     partial: Vec<u8>,
 }
 
@@ -155,6 +161,21 @@ impl Input {
     /// spindle asked, so a shell would see them as garbage typing. They also leave the prefix
     /// state alone, so moving the mouse between Ctrl-b and its key doesn't cancel the command.
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<Action> {
+        self.process(bytes, false)
+    }
+
+    /// True while bytes are held back waiting to see if they start a mouse report; call
+    /// [`Input::flush`] if nothing more arrives within [`ESC_WAIT`].
+    pub fn pending(&self) -> bool {
+        !self.partial.is_empty()
+    }
+
+    /// Gives up waiting: a held ESC or `ESC [` was typed, while an unfinished report is dropped.
+    pub fn flush(&mut self) -> Vec<Action> {
+        self.process(&[], true)
+    }
+
+    fn process(&mut self, bytes: &[u8], at_end: bool) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut plain = Vec::with_capacity(bytes.len());
         let joined;
@@ -168,9 +189,20 @@ impl Input {
         let mut i = 0;
         while i < bytes.len() {
             let b = bytes[i];
-            if bytes[i..].starts_with(SGR_MOUSE) {
-                let Some((len, mouse)) = parse_mouse(&bytes[i..]) else {
-                    self.partial = bytes[i..].to_vec();
+            let rest = &bytes[i..];
+            if rest.starts_with(SGR_MOUSE) && at_end {
+                break;
+            }
+            // A read can end anywhere inside a report, even before its `<`.
+            if !at_end && rest.len() < SGR_MOUSE.len() && SGR_MOUSE.starts_with(rest) {
+                self.partial = rest.to_vec();
+                break;
+            }
+            if rest.starts_with(SGR_MOUSE) {
+                let Some((len, mouse)) = parse_mouse(rest) else {
+                    if rest.len() <= MAX_MOUSE_REPORT {
+                        self.partial = rest.to_vec();
+                    }
                     break;
                 };
                 if let Some(mouse) = mouse {
@@ -325,6 +357,46 @@ mod tests {
     }
 
     #[test]
+    fn mouse_report_split_before_its_introducer_ends_is_joined() {
+        let mut input = Input::default();
+        assert_eq!(input.feed(b"x\x1b["), vec![Action::Bytes(b"x".to_vec())]);
+        assert_eq!(input.feed(b"<0;5;3M"), vec![left_press(4, 2)]);
+
+        let mut input = Input::default();
+        assert_eq!(input.feed(b"\x1b"), vec![]);
+        assert_eq!(input.feed(b"[<0;5;3M"), vec![left_press(4, 2)]);
+    }
+
+    #[test]
+    fn held_esc_followed_by_a_key_sequence_reaches_the_shell_whole() {
+        let mut input = Input::default();
+        assert_eq!(input.feed(b"\x1b"), vec![]);
+        assert_eq!(input.feed(b"[A"), vec![Action::Bytes(b"\x1b[A".to_vec())]);
+    }
+
+    #[test]
+    fn prefix_then_held_esc_still_forwards_both() {
+        let mut input = Input::default();
+        assert_eq!(input.feed(b"\x02\x1b"), vec![]);
+        assert_eq!(input.flush(), vec![Action::Bytes(b"\x02\x1b".to_vec())]);
+    }
+
+    #[test]
+    fn unfinished_reports_are_dropped_not_typed() {
+        let mut input = Input::default();
+        assert_eq!(input.feed(b"\x1b[<0;5"), vec![]);
+        assert_eq!(input.flush(), vec![]);
+
+        let runaway = [&b"\x1b[<"[..], &b"1;".repeat(40)].concat();
+        assert_eq!(input.feed(&runaway), vec![]);
+        assert!(
+            !input.pending(),
+            "past any real report's length, so not held"
+        );
+        assert_eq!(input.feed(b"a"), vec![Action::Bytes(b"a".to_vec())]);
+    }
+
+    #[test]
     fn mouse_kinds() {
         let kind = |bytes: &[u8]| match Input::default().feed(bytes).as_slice() {
             [Action::Mouse(m)] => m.kind(),
@@ -406,9 +478,14 @@ mod tests {
 
     #[test]
     fn lone_esc_and_arrows_still_pass_through() {
+        let mut input = Input::default();
+        assert_eq!(input.feed(b"\x1b"), vec![], "might be a report");
+        assert!(input.pending());
+        assert_eq!(input.flush(), vec![Action::Bytes(b"\x1b".to_vec())]);
+        assert!(!input.pending());
         assert_eq!(
-            Input::default().feed(b"\x1b"),
-            vec![Action::Bytes(b"\x1b".to_vec())]
+            Input::default().feed(b"q\x1b"),
+            vec![Action::Bytes(b"q".to_vec())]
         );
         assert_eq!(
             Input::default().feed(b"\x1b[A"),
@@ -440,14 +517,6 @@ mod tests {
                 Action::Focus(Direction::Up),
                 Action::Bytes(b"\x1b[B".to_vec()),
             ]
-        );
-    }
-
-    #[test]
-    fn prefix_then_esc_forwards_both() {
-        assert_eq!(
-            Input::default().feed(b"\x02\x1b"),
-            vec![Action::Bytes(b"\x02\x1b".to_vec())]
         );
     }
 }

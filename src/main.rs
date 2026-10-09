@@ -11,6 +11,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
 use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 
 use anyhow::{Result, bail};
 use crossterm::terminal;
@@ -98,6 +99,7 @@ fn run() -> Result<ExitCode> {
 
     let mut view = ui::View::Shell;
     let mut input = input::Input::default();
+    let mut flush_at: Option<Instant> = None;
     loop {
         let sidebar = ui::Sidebar {
             workspaces: session.workspace_count(),
@@ -105,123 +107,142 @@ fn run() -> Result<ExitCode> {
             dir: sidebar_dir.clone(),
         };
         term.draw(|f| ui::draw(f, &sidebar, &session.visible(), &view))?;
-        let Ok(event) = rx.recv() else {
-            unreachable!("the session holds a sender for the whole loop");
+        let event = match flush_at {
+            Some(at) => match rx.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(event) => Some(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    unreachable!("the session holds a sender for the whole loop")
+                }
+            },
+            None => Some(
+                rx.recv()
+                    .expect("the session holds a sender for the whole loop"),
+            ),
         };
-        match event {
-            Event::Output(id, bytes) => session.output(id, &bytes),
-            Event::Resize => {
+        let keys = match event {
+            None => input.flush(),
+            Some(Event::Keys(bytes)) => input.feed(&bytes),
+            Some(Event::Output(id, bytes)) => {
+                session.output(id, &bytes);
+                Vec::new()
+            }
+            Some(Event::Resize) => {
                 term.autoresize()?;
                 let size = term.size()?;
                 session.resize(ui::layout(Rect::new(0, 0, size.width, size.height)).pane)?;
+                Vec::new()
             }
-            Event::Exited(id) => {
+            Some(Event::Exited(id)) => {
                 if let Some(code) = session.exited(id)? {
                     return Ok(ExitCode::from(code.min(255) as u8));
                 }
+                Vec::new()
             }
-            Event::Keys(bytes) => {
-                let mut actions = VecDeque::from(input.feed(&bytes));
-                while let Some(action) = actions.pop_front() {
-                    // Pane and workspace commands act on the shells, so they bring them back into view.
-                    let shows_panes = matches!(
-                        action,
-                        input::Action::NewWorkspace
-                            | input::Action::Split(_)
-                            | input::Action::ClosePane
-                            | input::Action::FocusNext
-                            | input::Action::Focus(_)
-                            | input::Action::SelectWorkspace(_)
-                    );
-                    if shows_panes {
-                        view = ui::View::Shell;
+        };
+        // Measured from when bytes were first held, so a stream of shell output can't keep
+        // pushing the wait back.
+        flush_at = match (input.pending(), flush_at) {
+            (false, _) => None,
+            (true, Some(at)) => Some(at),
+            (true, None) => Some(Instant::now() + input::ESC_WAIT),
+        };
+        let mut actions = VecDeque::from(keys);
+        while let Some(action) = actions.pop_front() {
+            // Pane and workspace commands act on the shells, so they bring them back into view.
+            let shows_panes = matches!(
+                action,
+                input::Action::NewWorkspace
+                    | input::Action::Split(_)
+                    | input::Action::ClosePane
+                    | input::Action::FocusNext
+                    | input::Action::Focus(_)
+                    | input::Action::SelectWorkspace(_)
+            );
+            if shows_panes {
+                view = ui::View::Shell;
+            }
+            match action {
+                input::Action::Bytes(bytes) => match &mut view {
+                    ui::View::Shell => session.send(bytes),
+                    ui::View::Review(review) => {
+                        let page = ui::review_page(ui::layout(term_area(&term)?).pane_inner);
+                        let closed = review::parse_keys(&bytes)
+                            .into_iter()
+                            .any(|key| matches!(review.handle(key, page), review::Outcome::Close));
+                        if closed {
+                            view = ui::View::Shell;
+                        }
                     }
-                    match action {
-                        input::Action::Bytes(bytes) => match &mut view {
-                            ui::View::Shell => session.send(bytes),
-                            ui::View::Review(review) => {
-                                let page =
-                                    ui::review_page(ui::layout(term_area(&term)?).pane_inner);
-                                let closed = review::parse_keys(&bytes).into_iter().any(|key| {
-                                    matches!(review.handle(key, page), review::Outcome::Close)
-                                });
-                                if closed {
-                                    view = ui::View::Shell;
-                                }
+                    ui::View::Unavailable(_) => {
+                        if review::parse_keys(&bytes).contains(&review::Key::Close) {
+                            view = ui::View::Shell;
+                        }
+                    }
+                },
+                input::Action::Mouse(mouse) => {
+                    let hit = ui::hit(term_area(&term)?, &view, &sidebar, mouse.col, mouse.row);
+                    let over_panes = matches!(hit, ui::Hit::Nothing);
+                    if matches!(view, ui::View::Shell)
+                        && (over_panes || session.grabbing_mouse())
+                        && session.mouse(mouse)
+                    {
+                        continue;
+                    }
+                    match (hit, mouse.kind()) {
+                        (ui::Hit::MenuKey(key), input::MouseKind::LeftPress) => {
+                            actions.extend(input::command(key));
+                        }
+                        (ui::Hit::Workspace(i), input::MouseKind::LeftPress) => {
+                            actions.push_back(input::Action::SelectWorkspace(i));
+                        }
+                        (ui::Hit::TreeRow(row), input::MouseKind::LeftPress) => {
+                            if let ui::View::Review(review) = &mut view {
+                                review.click(row);
                             }
-                            ui::View::Unavailable(_) => {
-                                if review::parse_keys(&bytes).contains(&review::Key::Close) {
-                                    view = ui::View::Shell;
-                                }
+                        }
+                        (
+                            ui::Hit::TreeRow(_) | ui::Hit::ReviewPane,
+                            wheel @ (input::MouseKind::WheelUp | input::MouseKind::WheelDown),
+                        ) => {
+                            if let ui::View::Review(review) = &mut view {
+                                let key = if wheel == input::MouseKind::WheelUp {
+                                    review::Key::ScrollUp
+                                } else {
+                                    review::Key::ScrollDown
+                                };
+                                review.handle(key, session::WHEEL_LINES);
                             }
+                        }
+                        _ => {}
+                    }
+                }
+                input::Action::ToggleReview => {
+                    view = match view {
+                        ui::View::Shell => match review::Review::open(&launch_dir) {
+                            Ok(review) => ui::View::Review(Box::new(review)),
+                            Err(e) => ui::View::Unavailable(format!("{e:#}")),
                         },
-                        input::Action::Mouse(mouse) => {
-                            let hit =
-                                ui::hit(term_area(&term)?, &view, &sidebar, mouse.col, mouse.row);
-                            let over_panes = matches!(hit, ui::Hit::Nothing);
-                            if matches!(view, ui::View::Shell)
-                                && (over_panes || session.grabbing_mouse())
-                                && session.mouse(mouse)
-                            {
-                                continue;
-                            }
-                            match (hit, mouse.kind()) {
-                                (ui::Hit::MenuKey(key), input::MouseKind::LeftPress) => {
-                                    actions.extend(input::command(key));
-                                }
-                                (ui::Hit::Workspace(i), input::MouseKind::LeftPress) => {
-                                    actions.push_back(input::Action::SelectWorkspace(i));
-                                }
-                                (ui::Hit::TreeRow(row), input::MouseKind::LeftPress) => {
-                                    if let ui::View::Review(review) = &mut view {
-                                        review.click(row);
-                                    }
-                                }
-                                (
-                                    ui::Hit::TreeRow(_) | ui::Hit::ReviewPane,
-                                    wheel @ (input::MouseKind::WheelUp
-                                    | input::MouseKind::WheelDown),
-                                ) => {
-                                    if let ui::View::Review(review) = &mut view {
-                                        let key = if wheel == input::MouseKind::WheelUp {
-                                            review::Key::ScrollUp
-                                        } else {
-                                            review::Key::ScrollDown
-                                        };
-                                        review.handle(key, session::WHEEL_LINES);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        input::Action::ToggleReview => {
-                            view = match view {
-                                ui::View::Shell => match review::Review::open(&launch_dir) {
-                                    Ok(review) => ui::View::Review(Box::new(review)),
-                                    Err(e) => ui::View::Unavailable(format!("{e:#}")),
-                                },
-                                _ => ui::View::Shell,
-                            };
-                        }
-                        input::Action::NewWorkspace => {
-                            if let Err(e) = session.new_workspace() {
-                                view = ui::View::Unavailable(format!("Can't start a shell: {e:#}"));
-                            }
-                        }
-                        input::Action::Split(axis) => {
-                            if let Err(e) = session.split(axis) {
-                                view = ui::View::Unavailable(format!("Can't start a shell: {e:#}"));
-                            }
-                        }
-                        input::Action::ClosePane => session.close_focused(),
-                        input::Action::FocusNext => session.focus_next(),
-                        input::Action::Focus(dir) => session.focus_toward(dir),
-                        input::Action::SelectWorkspace(i) => session.select_workspace(i),
-                        input::Action::Quit => {
-                            session.kill_all()?;
-                            return Ok(ExitCode::SUCCESS);
-                        }
+                        _ => ui::View::Shell,
+                    };
+                }
+                input::Action::NewWorkspace => {
+                    if let Err(e) = session.new_workspace() {
+                        view = ui::View::Unavailable(format!("Can't start a shell: {e:#}"));
                     }
+                }
+                input::Action::Split(axis) => {
+                    if let Err(e) = session.split(axis) {
+                        view = ui::View::Unavailable(format!("Can't start a shell: {e:#}"));
+                    }
+                }
+                input::Action::ClosePane => session.close_focused(),
+                input::Action::FocusNext => session.focus_next(),
+                input::Action::Focus(dir) => session.focus_toward(dir),
+                input::Action::SelectWorkspace(i) => session.select_workspace(i),
+                input::Action::Quit => {
+                    session.kill_all()?;
+                    return Ok(ExitCode::SUCCESS);
                 }
             }
         }
