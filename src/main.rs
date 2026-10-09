@@ -162,6 +162,7 @@ fn run() -> Result<ExitCode> {
                                 }
                             }
                         },
+                        input::Action::Mouse(_) => {}
                         input::Action::ToggleReview => {
                             view = match view {
                                 ui::View::Shell => match review::Review::open(&launch_dir) {
