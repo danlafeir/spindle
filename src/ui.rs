@@ -39,6 +39,92 @@ pub fn review_page(pane_inner: Rect) -> usize {
     (pane_inner.height.saturating_sub(1) / 2).max(1) as usize
 }
 
+struct ReviewAreas {
+    tree: Rect,
+    divider: Rect,
+    header: Rect,
+    body: Rect,
+}
+
+/// Review geometry, shared by drawing and click handling so a click lands on the row drawn there.
+fn review_areas(inner: Rect) -> ReviewAreas {
+    let tree_width = (inner.width * 35 / 100).clamp(20, 40).min(inner.width);
+    let [tree, divider] =
+        Layout::horizontal([Constraint::Length(tree_width), Constraint::Min(0)]).areas(inner);
+    let content = review_divider().inner(divider);
+    let [header, body] =
+        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content);
+    ReviewAreas {
+        tree,
+        divider,
+        header,
+        body,
+    }
+}
+
+fn review_divider() -> Block<'static> {
+    Block::new()
+        .borders(Borders::LEFT)
+        .border_style(Style::new().dark_gray())
+}
+
+/// The first tree row on screen: the tree scrolls only as far as needed to keep the cursor visible.
+fn tree_offset(review: &Review, height: u16) -> usize {
+    review
+        .cursor()
+        .saturating_sub((height as usize).saturating_sub(1))
+}
+
+fn menu_area(sidebar: Rect) -> Rect {
+    let inner = Block::bordered().inner(sidebar);
+    Rect {
+        height: inner.height.min(2),
+        ..inner
+    }
+}
+
+pub enum Hit {
+    MenuKey(u8),
+    TreeRow(usize),
+    ReviewPane,
+    Nothing,
+}
+
+/// What lies under screen cell (`col`, `row`).
+pub fn hit(screen: Rect, view: &View, col: u16, row: u16) -> Hit {
+    let areas = layout(screen);
+    let pos = ratatui::layout::Position::new(col, row);
+    let menu = menu_area(areas.sidebar);
+    if menu.contains(pos) {
+        let line = &menu_lines()[(row - menu.y) as usize];
+        let mut x = menu.x;
+        // A key and the label after it both count as the button.
+        let mut key = None;
+        for span in &line.spans {
+            let width = span.width() as u16;
+            if span.style.fg == Some(Color::Cyan) {
+                key = span.content.bytes().next();
+            }
+            if col < x + width {
+                return key.map_or(Hit::Nothing, Hit::MenuKey);
+            }
+            x += width;
+        }
+        return Hit::Nothing;
+    }
+    let View::Review(review) = view else {
+        return Hit::Nothing;
+    };
+    if !areas.pane_inner.contains(pos) {
+        return Hit::Nothing;
+    }
+    let tree = review_areas(areas.pane_inner).tree;
+    if tree.contains(pos) {
+        return Hit::TreeRow(tree_offset(review, tree.height) + (row - tree.y) as usize);
+    }
+    Hit::ReviewPane
+}
+
 pub fn draw(frame: &mut Frame, screen: &vt100::Screen, view: &View) {
     let areas = layout(frame.area());
 
@@ -46,12 +132,13 @@ pub fn draw(frame: &mut Frame, screen: &vt100::Screen, view: &View) {
     let inner = sidebar.inner(areas.sidebar);
     frame.render_widget(sidebar, areas.sidebar);
 
-    let [menu, rule, body] = Layout::vertical([
+    let [_, rule, body] = Layout::vertical([
         Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Min(0),
     ])
     .areas(inner);
+    let menu = menu_area(areas.sidebar);
     frame.render_widget(Paragraph::new(menu_lines()), menu);
     frame.render_widget(Block::new().borders(Borders::TOP).dark_gray(), rule);
     frame.render_widget(Paragraph::new(placeholder_lists()), body);
@@ -103,33 +190,26 @@ fn draw_review(frame: &mut Frame, area: Rect, review: &Review) {
         .title_bottom(
             Line::from(" j/k move  h/l fold  J/K scroll  r refresh  q close ").dark_gray(),
         );
-    let inner = block.inner(area);
+    let ReviewAreas {
+        tree,
+        divider,
+        header,
+        body,
+    } = review_areas(block.inner(area));
     frame.render_widget(block, area);
 
-    let tree_width = (inner.width * 35 / 100).clamp(20, 40).min(inner.width);
-    let [tree, content] =
-        Layout::horizontal([Constraint::Length(tree_width), Constraint::Min(0)]).areas(inner);
-
     // Draws only the visible window so large repos don't build every row each frame.
-    let height = tree.height as usize;
-    let offset = review.cursor().saturating_sub(height.saturating_sub(1));
     let rows: Vec<Line> = review
         .rows()
         .iter()
         .enumerate()
-        .skip(offset)
-        .take(height)
+        .skip(tree_offset(review, tree.height))
+        .take(tree.height as usize)
         .map(|(i, row)| tree_line(row, i == review.cursor()))
         .collect();
     frame.render_widget(Paragraph::new(rows), tree);
 
-    let divider = Block::new()
-        .borders(Borders::LEFT)
-        .border_style(Style::new().dark_gray());
-    let content_inner = divider.inner(content);
-    frame.render_widget(divider, content);
-    let [header, body] =
-        Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(content_inner);
+    frame.render_widget(review_divider(), divider);
     let title = review
         .selected()
         .map_or_else(String::new, |r| r.path.display().to_string());
@@ -336,6 +416,86 @@ mod tests {
         assert!(text.contains("+spaced and changed"));
         assert!(text.contains("q close"));
         assert!(!text.contains('\x1b'));
+    }
+
+    /// The screen cell where `needle` is drawn.
+    fn find(rows: &[String], needle: &str) -> (u16, u16) {
+        rows.iter()
+            .enumerate()
+            .find_map(|(y, r)| {
+                let byte = r.find(needle)?;
+                Some((r[..byte].chars().count() as u16, y as u16))
+            })
+            .unwrap_or_else(|| panic!("{needle:?} not drawn"))
+    }
+
+    #[test]
+    fn clicks_on_menu_keys_and_labels_hit_that_key() {
+        let area = Rect::new(0, 0, 80, 24);
+        let parser = vt100::Parser::new(1, 1, 0);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|f| draw(f, parser.screen(), &View::Shell))
+            .unwrap();
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| row(terminal.backend().buffer(), y))
+            .collect();
+
+        let key_at = |(x, y): (u16, u16)| match hit(area, &View::Shell, x, y) {
+            Hit::MenuKey(k) => Some(k as char),
+            _ => None,
+        };
+        let (x, y) = find(&rows, "g review");
+        assert_eq!(key_at((x, y)), Some('g'));
+        assert_eq!(key_at((x + 4, y)), Some('g'), "label");
+        let (x, y) = find(&rows, "q quit");
+        assert_eq!(key_at((x, y)), Some('q'));
+        assert_eq!(key_at((x + 5, y)), Some('q'), "label");
+        assert_eq!(key_at(find(&rows, "^b")), None);
+        assert_eq!(key_at(find(&rows, "WORKSPACES")), None);
+    }
+
+    #[test]
+    fn clicks_on_tree_rows_hit_the_row_drawn_there_even_when_scrolled() {
+        let tmp = crate::git::tests::fixture();
+        let mut review = Review::open(tmp.path()).unwrap();
+        // A pane so short the tree has to scroll to keep the cursor in view.
+        let area = Rect::new(0, 0, 100, 6);
+        review.handle(crate::review::Key::Bottom, 1);
+        let view = View::Review(Box::new(review));
+        let parser = vt100::Parser::new(1, 1, 0);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal.draw(|f| draw(f, parser.screen(), &view)).unwrap();
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| row(terminal.backend().buffer(), y))
+            .collect();
+        println!("{}", rows.join("\n"));
+        let View::Review(review) = &view else {
+            unreachable!()
+        };
+
+        let inner = layout(area).pane_inner;
+        let tree = review_areas(inner).tree;
+        assert!(
+            tree_offset(review, tree.height) > 0,
+            "tree should be scrolled"
+        );
+        for y in tree.y..tree.bottom() {
+            let Hit::TreeRow(i) = hit(area, &view, tree.x + 1, y) else {
+                panic!("row {y} isn't a tree row");
+            };
+            let drawn: String = rows[y as usize]
+                .chars()
+                .skip(tree.x as usize)
+                .take(tree.width as usize)
+                .collect();
+            assert!(
+                drawn.contains(&review.rows()[i].name()),
+                "{drawn:?} vs row {i}"
+            );
+        }
+        let body = review_areas(inner).body;
+        assert!(matches!(hit(area, &view, body.x, body.y), Hit::ReviewPane));
     }
 
     #[test]

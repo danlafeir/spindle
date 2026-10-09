@@ -17,6 +17,12 @@ The prefix is `Ctrl-b`, then:
 
 Any other key after the prefix is passed to the shell along with the `Ctrl-b`.
 
+## Mouse
+
+Click `review` or `quit` in the sidebar menu to do the same as `Ctrl-b g` or `Ctrl-b q`. In the review view, click a file to show it or a folder to fold it, and use the wheel to scroll the diff.
+
+spindle captures the mouse, so dragging no longer selects text. In Terminal.app, hold `Fn` while dragging to select, or turn off View → Allow Mouse Reporting.
+
 ## Reviewing changes
 
 `Ctrl-b g` swaps the shell pane for a review of uncommitted changes: everything that differs from `HEAD`, staged and unstaged together. On the left is a tree of the whole repo (gitignored paths hidden) with changed files marked `M` modified, `A` added, `D` deleted, `R` renamed or `?` untracked. Folders containing changes start expanded. On the right is the selected file's diff, or its contents if it hasn't changed. The shell keeps running underneath.

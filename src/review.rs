@@ -318,6 +318,15 @@ impl Review {
         self.select();
     }
 
+    /// Selects `row` the way a mouse click would: a folder also toggles open or closed.
+    pub fn click(&mut self, row: usize) {
+        if row >= self.rows.len() {
+            return;
+        }
+        self.move_to(row);
+        self.handle(Key::Enter, 0);
+    }
+
     /// `page` is how many lines a scroll key moves the content.
     pub fn handle(&mut self, key: Key, page: usize) -> Outcome {
         match key {
@@ -483,6 +492,20 @@ mod tests {
         review.handle(Key::Up, 10);
         assert_eq!(review.selected().unwrap().path, Path::new("keep.txt"));
         assert!(matches!(review.content(), Content::File(l) if l == &["keep.txt"]));
+    }
+
+    #[test]
+    fn clicks_select_files_and_toggle_folders() {
+        let tmp = fixture();
+        let mut review = Review::open(tmp.path()).unwrap();
+        review.click(5);
+        assert_eq!(review.selected().unwrap().path, Path::new("keep.txt"));
+        review.click(0);
+        assert_eq!(names(&review)[1], ".gitignore", "src/ folds");
+        review.click(0);
+        assert_eq!(names(&review)[1], "  dir file.txt", "and unfolds");
+        review.click(99);
+        assert_eq!(review.selected().unwrap().path, Path::new("src"));
     }
 
     #[test]

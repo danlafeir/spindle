@@ -39,6 +39,15 @@ impl Mouse {
     }
 }
 
+/// The command bound to `key` after the prefix, shared with clicks on the sidebar menu.
+pub fn command(key: u8) -> Option<Action> {
+    match key {
+        b'q' => Some(Action::Quit),
+        b'g' => Some(Action::ToggleReview),
+        _ => None,
+    }
+}
+
 /// Parses `ESC [ < code ; col ; row (M|m)` at the start of `bytes`. `None` means the bytes end
 /// before the sequence does; otherwise returns how many bytes it spans and the report, which
 /// is absent if the sequence was malformed.
@@ -117,18 +126,19 @@ impl Input {
             }
             self.prefixed = false;
             let command = match b {
-                b'q' => Action::Quit,
-                b'g' => Action::ToggleReview,
                 // Advertised in the menu but not implemented yet; swallowed so they don't leak to the shell.
                 b'n' | b's' => continue,
                 PREFIX => {
                     plain.push(PREFIX);
                     continue;
                 }
-                other => {
-                    plain.extend([PREFIX, other]);
-                    continue;
-                }
+                other => match command(other) {
+                    Some(command) => command,
+                    None => {
+                        plain.extend([PREFIX, other]);
+                        continue;
+                    }
+                },
             };
             if !plain.is_empty() {
                 actions.push(Action::Bytes(std::mem::take(&mut plain)));

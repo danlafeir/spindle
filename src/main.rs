@@ -4,6 +4,7 @@ mod pty;
 mod review;
 mod ui;
 
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
 use std::sync::mpsc;
@@ -23,10 +24,22 @@ enum Event {
     Keys(Vec<u8>),
 }
 
+// Click and drag reports (1000, 1002) in SGR encoding (1006), which has no 223-column limit.
+// Any-motion tracking (1003) is left off so idle mouse movement doesn't wake the loop.
+const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
+const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
+
+const WHEEL_LINES: usize = 3;
+
 struct RestoreTerminal;
 
 impl Drop for RestoreTerminal {
     fn drop(&mut self) {
+        // ratatui::restore doesn't know about mouse capture; left on, the shell spindle exits
+        // to would be flooded with mouse reports on every click.
+        let _ = io::stdout()
+            .write_all(MOUSE_OFF)
+            .and_then(|_| io::stdout().flush());
         ratatui::restore();
     }
 }
@@ -71,6 +84,8 @@ fn run() -> Result<ExitCode> {
 
     let mut term = ratatui::try_init()?;
     let _restore = RestoreTerminal;
+    io::stdout().write_all(MOUSE_ON)?;
+    io::stdout().flush()?;
     let (tx, rx) = mpsc::channel();
 
     let output_tx = tx.clone();
@@ -141,7 +156,8 @@ fn run() -> Result<ExitCode> {
             }
             Event::Exited => break,
             Event::Keys(bytes) => {
-                for action in input.feed(&bytes) {
+                let mut actions = VecDeque::from(input.feed(&bytes));
+                while let Some(action) = actions.pop_front() {
                     match action {
                         input::Action::Bytes(bytes) => match &mut view {
                             ui::View::Shell => {
@@ -162,7 +178,35 @@ fn run() -> Result<ExitCode> {
                                 }
                             }
                         },
-                        input::Action::Mouse(_) => {}
+                        input::Action::Mouse(mouse) => {
+                            let size = term.size()?;
+                            let screen = Rect::new(0, 0, size.width, size.height);
+                            match (ui::hit(screen, &view, mouse.col, mouse.row), mouse.kind()) {
+                                (ui::Hit::MenuKey(key), input::MouseKind::LeftPress) => {
+                                    actions.extend(input::command(key));
+                                }
+                                (ui::Hit::TreeRow(row), input::MouseKind::LeftPress) => {
+                                    if let ui::View::Review(review) = &mut view {
+                                        review.click(row);
+                                    }
+                                }
+                                (
+                                    ui::Hit::TreeRow(_) | ui::Hit::ReviewPane,
+                                    wheel @ (input::MouseKind::WheelUp
+                                    | input::MouseKind::WheelDown),
+                                ) => {
+                                    if let ui::View::Review(review) = &mut view {
+                                        let key = if wheel == input::MouseKind::WheelUp {
+                                            review::Key::ScrollUp
+                                        } else {
+                                            review::Key::ScrollDown
+                                        };
+                                        review.handle(key, WHEEL_LINES);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                         input::Action::ToggleReview => {
                             view = match view {
                                 ui::View::Shell => match review::Review::open(&launch_dir) {
