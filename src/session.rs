@@ -29,10 +29,19 @@ struct Pane {
     input: Sender<Vec<u8>>,
 }
 
-fn pty_size(inner: Rect) -> PtySize {
+/// vt100 panics on a 0-row, 0-column or 1x1 screen, which a squeezed terminal can give a pane,
+/// so the shell is told it has at least 2x2 and whatever doesn't fit is clipped when drawn.
+const MIN_SCREEN: u16 = 2;
+
+/// The (rows, cols) a pane's emulator and PTY use for a drawn area of `inner`.
+fn screen_size(inner: Rect) -> (u16, u16) {
+    (inner.height.max(MIN_SCREEN), inner.width.max(MIN_SCREEN))
+}
+
+fn pty_size((rows, cols): (u16, u16)) -> PtySize {
     PtySize {
-        rows: inner.height,
-        cols: inner.width,
+        rows,
+        cols,
         ..Default::default()
     }
 }
@@ -82,7 +91,7 @@ impl Session {
             child,
             mut reader,
             mut writer,
-        } = pty::spawn(cmd, pty_size(inner))?;
+        } = pty::spawn(cmd, pty_size(screen_size(inner)))?;
         self.next_id += 1;
 
         let output = self.events.clone();
@@ -117,7 +126,10 @@ impl Session {
             Pane {
                 master,
                 child,
-                parser: vt100::Parser::new(inner.height, inner.width, 0),
+                parser: {
+                    let (rows, cols) = screen_size(inner);
+                    vt100::Parser::new(rows, cols, 0)
+                },
                 input,
             },
         );
@@ -209,9 +221,10 @@ impl Session {
             for (id, rect) in ws.rects(self.area) {
                 let inner = ui::pane_inner(rect);
                 let pane = self.panes.get_mut(&id).expect("every tree pane is live");
-                if pane.parser.screen().size() != (inner.height, inner.width) {
-                    pane.parser.screen_mut().set_size(inner.height, inner.width);
-                    pane.master.resize(pty_size(inner))?;
+                let size = screen_size(inner);
+                if pane.parser.screen().size() != size {
+                    pane.parser.screen_mut().set_size(size.0, size.1);
+                    pane.master.resize(pty_size(size))?;
                 }
             }
         }
@@ -453,6 +466,31 @@ mod tests {
         session.mouse(Mouse { col: 26, ..click });
         assert_eq!(sent(), b"");
         assert!(!session.grabbing_mouse());
+        session.kill_all().unwrap();
+    }
+
+    #[test]
+    fn squeezed_panes_survive() {
+        let (tx, _rx) = mpsc::channel();
+        // Wide enough for the sidebar only: the pane's inside is 0 columns wide.
+        let mut session = Session::new(
+            "/bin/sh".into(),
+            std::env::temp_dir(),
+            Rect::new(26, 0, 2, 40),
+            tx,
+        )
+        .unwrap();
+        session.output(session.focused(), b"hello\r\nworld");
+        for area in [
+            Rect::new(26, 0, 0, 0),
+            Rect::new(26, 0, 3, 3),
+            Rect::new(26, 0, 80, 2),
+            Rect::new(26, 0, 80, 24),
+        ] {
+            session.resize(area).unwrap();
+            session.output(session.focused(), b"more\r\n");
+        }
+        assert_eq!(session.visible()[0].screen.size(), (22, 78));
         session.kill_all().unwrap();
     }
 
