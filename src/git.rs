@@ -66,6 +66,8 @@ fn run(dir: &Path, args: &[&str]) -> Result<Output> {
         .args(args)
         // Read-only views must not take index.lock and collide with git running in the shell.
         .env("GIT_OPTIONAL_LOCKS", "0")
+        // Paths come from git's own listings, so `[`, `*` or `?` in a name is literal, never a glob.
+        .env("GIT_LITERAL_PATHSPECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -291,6 +293,26 @@ pub mod tests {
             Some(&Change::Renamed { from: "a.c".into() })
         );
         assert_eq!(changes.get(Path::new("mod.txt")), Some(&Change::Modified));
+    }
+
+    #[test]
+    fn glob_characters_in_a_name_match_only_that_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q"]);
+        write(dir, "a[b].txt", "one\n");
+        write(dir, "ab.txt", "two\n");
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+        write(dir, "a[b].txt", "one changed\n");
+        write(dir, "ab.txt", "two changed\n");
+
+        let diff = Repo::discover(dir)
+            .unwrap()
+            .diff(Path::new("a[b].txt"), &Change::Modified)
+            .unwrap();
+        assert!(diff.contains("+one changed"));
+        assert!(!diff.contains("ab.txt"), "{diff}");
     }
 
     #[test]
