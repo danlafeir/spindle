@@ -25,8 +25,6 @@ use session::{Event, Session};
 const MOUSE_ON: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1006h";
 const MOUSE_OFF: &[u8] = b"\x1b[?1006l\x1b[?1002l\x1b[?1000l";
 
-const WHEEL_LINES: usize = 3;
-
 struct RestoreTerminal;
 
 impl Drop for RestoreTerminal {
@@ -158,11 +156,16 @@ fn run() -> Result<ExitCode> {
                             }
                         },
                         input::Action::Mouse(mouse) => {
-                            let screen = term_area(&term)?;
-                            match (
-                                ui::hit(screen, &view, &sidebar, mouse.col, mouse.row),
-                                mouse.kind(),
-                            ) {
+                            let hit =
+                                ui::hit(term_area(&term)?, &view, &sidebar, mouse.col, mouse.row);
+                            let over_panes = matches!(hit, ui::Hit::Nothing);
+                            if matches!(view, ui::View::Shell)
+                                && (over_panes || session.grabbing_mouse())
+                                && session.mouse(mouse)
+                            {
+                                continue;
+                            }
+                            match (hit, mouse.kind()) {
                                 (ui::Hit::MenuKey(key), input::MouseKind::LeftPress) => {
                                     actions.extend(input::command(key));
                                 }
@@ -185,13 +188,8 @@ fn run() -> Result<ExitCode> {
                                         } else {
                                             review::Key::ScrollDown
                                         };
-                                        review.handle(key, WHEEL_LINES);
+                                        review.handle(key, session::WHEEL_LINES);
                                     }
-                                }
-                                (ui::Hit::Nothing, input::MouseKind::LeftPress)
-                                    if matches!(view, ui::View::Shell) =>
-                                {
-                                    session.focus_at(mouse.col, mouse.row);
                                 }
                                 _ => {}
                             }

@@ -8,9 +8,12 @@ use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use ratatui::layout::{Position, Rect};
 
+use crate::input::{Mouse, MouseKind};
 use crate::pty;
 use crate::ui;
 use crate::workspace::{Axis, Direction, PaneId, Workspace};
+
+pub const WHEEL_LINES: usize = 3;
 
 pub enum Event {
     Output(PaneId, Vec<u8>),
@@ -45,6 +48,9 @@ pub struct Session {
     cwd: PathBuf,
     events: Sender<Event>,
     area: Rect,
+    /// The pane a mouse button went down in. Drags and the release follow it there even if the
+    /// pointer leaves, so the app never sees a button that is stuck down.
+    mouse_grab: Option<PaneId>,
 }
 
 impl Session {
@@ -59,6 +65,7 @@ impl Session {
             cwd,
             events,
             area,
+            mouse_grab: None,
         };
         session.new_workspace()?;
         Ok(session)
@@ -214,7 +221,72 @@ impl Session {
     pub fn select_workspace(&mut self, index: usize) {
         if index < self.workspaces.len() {
             self.active = index;
+            self.mouse_grab = None;
         }
+    }
+
+    pub fn grabbing_mouse(&self) -> bool {
+        self.mouse_grab.is_some()
+    }
+
+    /// Handles a mouse report over the panes: a press focuses its pane, and the report goes on
+    /// to the app there if it asked for the mouse. Returns false when the report isn't over a
+    /// pane and no drag is under way, leaving it for the caller.
+    pub fn mouse(&mut self, mouse: Mouse) -> bool {
+        let pos = Position::new(mouse.col, mouse.row);
+        let rects = self.workspaces[self.active].rects(self.area);
+        let under = rects
+            .iter()
+            .find(|(_, r)| r.contains(pos))
+            .map(|(id, _)| *id);
+        let target = self.mouse_grab.or(under);
+        let Some((id, rect)) = rects.into_iter().find(|(id, _)| Some(*id) == target) else {
+            self.mouse_grab = None;
+            return false;
+        };
+        let inner = ui::pane_inner(rect);
+        let press = !mouse.release && !mouse.is_motion() && !mouse.is_wheel();
+        if press {
+            self.workspaces[self.active].set_focus(id);
+        }
+        // A press on the border only focuses; it isn't inside the app's screen.
+        if self.mouse_grab.is_none() && !inner.contains(pos) {
+            return true;
+        }
+        if press {
+            self.mouse_grab = Some(id);
+        } else if mouse.release && !mouse.is_wheel() {
+            self.mouse_grab = None;
+        }
+
+        let col = mouse
+            .col
+            .saturating_sub(inner.x)
+            .min(inner.width.saturating_sub(1));
+        let row = mouse
+            .row
+            .saturating_sub(inner.y)
+            .min(inner.height.saturating_sub(1));
+        let pane = &self.panes[&id];
+        let screen = pane.parser.screen();
+        let mode = screen.mouse_protocol_mode();
+        if let Some(bytes) = mouse.encode_for(col, row, mode, screen.mouse_protocol_encoding()) {
+            let _ = pane.input.send(bytes);
+            return true;
+        }
+        // Like most terminals, scroll full-screen apps that don't take the mouse (less, man)
+        // with arrow keys. At a shell prompt that would walk history, so it's left alone there.
+        if mode == vt100::MouseProtocolMode::None && screen.alternate_screen() {
+            let arrow = match (mouse.kind(), screen.application_cursor()) {
+                (MouseKind::WheelUp, false) => "\x1b[A",
+                (MouseKind::WheelDown, false) => "\x1b[B",
+                (MouseKind::WheelUp, true) => "\x1bOA",
+                (MouseKind::WheelDown, true) => "\x1bOB",
+                _ => return true,
+            };
+            let _ = pane.input.send(arrow.repeat(WHEEL_LINES).into_bytes());
+        }
+        true
     }
 
     pub fn focus_next(&mut self) {
@@ -223,22 +295,6 @@ impl Session {
 
     pub fn focus_toward(&mut self, dir: Direction) {
         self.workspaces[self.active].focus_toward(dir, self.area);
-    }
-
-    /// Focuses the pane under a click; returns false if the click missed every pane.
-    pub fn focus_at(&mut self, col: u16, row: u16) -> bool {
-        let ws = &mut self.workspaces[self.active];
-        let hit = ws
-            .rects(self.area)
-            .into_iter()
-            .find(|(_, r)| r.contains(Position::new(col, row)));
-        match hit {
-            Some((id, _)) => {
-                ws.set_focus(id);
-                true
-            }
-            None => false,
-        }
     }
 
     pub fn workspace_count(&self) -> usize {
@@ -341,6 +397,62 @@ mod tests {
             }
         }
         assert_eq!(session.visible().len(), 1);
+        session.kill_all().unwrap();
+    }
+
+    #[test]
+    fn mouse_reaches_apps_that_ask_for_it_relative_to_their_pane() {
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(26, 0, 80, 24);
+        let mut session = Session::new("/bin/sh".into(), std::env::temp_dir(), area, tx).unwrap();
+        let id = session.focused();
+        // Stand in for the PTY writer so the test sees exactly what the app would read.
+        let (typed_tx, typed) = mpsc::channel();
+        session.panes.get_mut(&id).unwrap().input = typed_tx;
+        let sent = || typed.try_iter().flatten().collect::<Vec<u8>>();
+
+        let click = Mouse {
+            code: 0,
+            col: 36,
+            row: 5,
+            release: false,
+        };
+        let release = Mouse {
+            release: true,
+            ..click
+        };
+        let wheel_down = Mouse { code: 65, ..click };
+
+        assert!(session.mouse(click));
+        assert!(session.grabbing_mouse());
+        session.mouse(release);
+        assert!(!session.grabbing_mouse(), "release ends the grab");
+        session.mouse(wheel_down);
+        assert_eq!(
+            sent(),
+            b"",
+            "a shell prompt gets neither clicks nor wheel arrows"
+        );
+
+        // less and man use the alternate screen without asking for the mouse.
+        session.output(id, b"\x1b[?1049h");
+        session.mouse(wheel_down);
+        assert_eq!(sent(), b"\x1b[B\x1b[B\x1b[B");
+
+        session.output(id, b"\x1b[?1000h\x1b[?1006h");
+        session.mouse(click);
+        // A release dragged out over the sidebar still goes to the pane, clamped to its edge.
+        session.mouse(Mouse { col: 0, ..release });
+        assert_eq!(
+            sent(),
+            b"\x1b[<0;10;5M\x1b[<0;1;5m",
+            "the pane's screen starts at column 27, so column 36 is the app's 10th"
+        );
+
+        // A press on the border only focuses.
+        session.mouse(Mouse { col: 26, ..click });
+        assert_eq!(sent(), b"");
+        assert!(!session.grabbing_mouse());
         session.kill_all().unwrap();
     }
 

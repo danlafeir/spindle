@@ -1,6 +1,8 @@
 const PREFIX: u8 = 0x02; // Ctrl-b
 const SGR_MOUSE: &[u8] = b"\x1b[<";
 
+use vt100::{MouseProtocolEncoding, MouseProtocolMode};
+
 use crate::workspace::{Axis, Direction};
 
 #[derive(Debug, PartialEq)]
@@ -45,6 +47,56 @@ impl Mouse {
             (65, _) => MouseKind::WheelDown,
             _ => MouseKind::Other,
         }
+    }
+
+    pub fn is_wheel(&self) -> bool {
+        self.code & 64 != 0
+    }
+
+    pub fn is_motion(&self) -> bool {
+        self.code & 32 != 0
+    }
+
+    /// Re-encodes this report for an app at (`col`, `row`) of its own screen, in the form it
+    /// asked for. `None` when its mode doesn't want this kind of event, or its encoding can't
+    /// express the position.
+    pub fn encode_for(
+        &self,
+        col: u16,
+        row: u16,
+        mode: MouseProtocolMode,
+        encoding: MouseProtocolEncoding,
+    ) -> Option<Vec<u8>> {
+        let wanted = match mode {
+            MouseProtocolMode::None => false,
+            MouseProtocolMode::Press => !self.release && !self.is_motion(),
+            MouseProtocolMode::PressRelease => !self.is_motion(),
+            MouseProtocolMode::ButtonMotion | MouseProtocolMode::AnyMotion => true,
+        };
+        if !wanted {
+            return None;
+        }
+        let (x, y) = (u32::from(col) + 1, u32::from(row) + 1);
+        if encoding == MouseProtocolEncoding::Sgr {
+            let end = if self.release { 'm' } else { 'M' };
+            return Some(format!("\x1b[<{};{x};{y}{end}", self.code).into_bytes());
+        }
+        // The older encodings can't say which button was released, only that one was.
+        let code = u32::from(if self.release {
+            self.code | 0b11
+        } else {
+            self.code
+        });
+        let mut out = b"\x1b[M".to_vec();
+        for value in [code + 32, x + 32, y + 32] {
+            if encoding == MouseProtocolEncoding::Default {
+                out.push(u8::try_from(value).ok()?);
+            } else {
+                let mut buf = [0; 4];
+                out.extend(char::from_u32(value)?.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+        Some(out)
     }
 }
 
@@ -292,6 +344,55 @@ mod tests {
         assert_eq!(
             Input::default().feed(b"\x02\x1b[<0;1;1Mq"),
             vec![left_press(0, 0), Action::Quit]
+        );
+    }
+
+    #[test]
+    fn mouse_is_re_encoded_only_for_what_the_app_asked() {
+        use MouseProtocolEncoding as E;
+        use MouseProtocolMode as M;
+        let press = Mouse {
+            code: 0,
+            col: 9,
+            row: 4,
+            release: false,
+        };
+        let release = Mouse {
+            release: true,
+            ..press
+        };
+        let drag = Mouse { code: 32, ..press };
+
+        assert_eq!(press.encode_for(9, 4, M::None, E::Sgr), None);
+        assert_eq!(
+            press.encode_for(9, 4, M::PressRelease, E::Sgr),
+            Some(b"\x1b[<0;10;5M".to_vec())
+        );
+        assert_eq!(
+            release.encode_for(9, 4, M::PressRelease, E::Sgr),
+            Some(b"\x1b[<0;10;5m".to_vec())
+        );
+        assert_eq!(release.encode_for(9, 4, M::Press, E::Sgr), None);
+        assert_eq!(drag.encode_for(9, 4, M::PressRelease, E::Sgr), None);
+        assert!(drag.encode_for(9, 4, M::ButtonMotion, E::Sgr).is_some());
+
+        assert_eq!(
+            press.encode_for(9, 4, M::PressRelease, E::Default),
+            Some(b"\x1b[M *%".to_vec())
+        );
+        assert_eq!(
+            release.encode_for(9, 4, M::PressRelease, E::Default),
+            Some(b"\x1b[M#*%".to_vec()),
+            "release is button 3"
+        );
+        assert_eq!(
+            press.encode_for(300, 4, M::PressRelease, E::Default),
+            None,
+            "past column 223"
+        );
+        assert_eq!(
+            press.encode_for(300, 4, M::PressRelease, E::Utf8),
+            Some("\x1b[M \u{14d}%".as_bytes().to_vec())
         );
     }
 

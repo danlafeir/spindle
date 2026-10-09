@@ -28,6 +28,8 @@ Any other key after the prefix is passed to the shell along with the `Ctrl-b`. S
 
 Click any command in the sidebar menu to run it, a workspace in the sidebar to switch to it, or a pane to focus it. In the review view, click a file to show it or a folder to fold it, and use the wheel to scroll the diff.
 
+Programs that ask for the mouse, such as vim, htop or tmux, get clicks, drags and the wheel in their own pane. A drag stays with the pane it started in even if the pointer leaves it. Full-screen programs that don't ask for the mouse, such as less and man, scroll with the wheel. At a plain shell prompt the wheel does nothing, so it won't walk through your history.
+
 spindle captures the mouse, so dragging no longer selects text. In Terminal.app, hold `Fn` while dragging to select, or turn off View → Allow Mouse Reporting.
 
 ## Reviewing changes
