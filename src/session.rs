@@ -193,6 +193,10 @@ impl Session {
         Ok(())
     }
 
+    pub fn is_visible(&self, id: PaneId) -> bool {
+        self.workspaces[self.active].contains(id)
+    }
+
     pub fn output(&mut self, id: PaneId, bytes: &[u8]) {
         if let Some(pane) = self.panes.get_mut(&id) {
             pane.parser.process(bytes);
