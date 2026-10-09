@@ -11,6 +11,8 @@ use anyhow::{Context, Result, bail};
 use wait_timeout::ChildExt;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// The same cap the review puts on reading a whole file.
+const MAX_DIFF_BYTES: u64 = 1024 * 1024;
 
 /// How a path differs between HEAD and the working tree, staged and unstaged combined.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -58,15 +60,25 @@ impl Output {
     }
 }
 
-fn drain(mut pipe: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+/// Reads up to `limit` bytes, plus one so the caller can tell it was cut short. The rest is
+/// read and thrown away: git must be able to finish writing, or it would block until killed.
+fn drain(mut pipe: impl Read + Send + 'static, limit: u64) -> thread::JoinHandle<Vec<u8>> {
     thread::spawn(move || {
         let mut buf = Vec::new();
-        let _ = pipe.read_to_end(&mut buf);
+        let _ = pipe
+            .by_ref()
+            .take(limit.saturating_add(1))
+            .read_to_end(&mut buf);
+        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
         buf
     })
 }
 
 fn run(dir: &Path, args: &[&str]) -> Result<Output> {
+    run_capped(dir, args, u64::MAX)
+}
+
+fn run_capped(dir: &Path, args: &[&str], stdout_limit: u64) -> Result<Output> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -81,8 +93,8 @@ fn run(dir: &Path, args: &[&str]) -> Result<Output> {
         .spawn()
         .context("could not run git")?;
     // Drained concurrently: a diff larger than the pipe buffer would otherwise block git forever.
-    let stdout = drain(child.stdout.take().expect("stdout is piped"));
-    let stderr = drain(child.stderr.take().expect("stderr is piped"));
+    let stdout = drain(child.stdout.take().expect("stdout is piped"), stdout_limit);
+    let stderr = drain(child.stderr.take().expect("stderr is piped"), u64::MAX);
 
     let Some(status) = child.wait_timeout(TIMEOUT)? else {
         let _ = child.kill();
@@ -191,20 +203,31 @@ impl Repo {
         let out = match change {
             Change::Untracked => {
                 let args = [&base[..], &["--no-index", "--", "/dev/null", &path]].concat();
-                run(&self.root, &args)?
+                run_capped(&self.root, &args, MAX_DIFF_BYTES)?
             }
             Change::Renamed { from } => {
                 let from = from.to_string_lossy();
                 let args = [&base[..], &["-M", "HEAD", "--", &from, &path]].concat();
-                run(&self.root, &args)?
+                run_capped(&self.root, &args, MAX_DIFF_BYTES)?
             }
-            _ => run(&self.root, &[&base[..], &["HEAD", "--", &path]].concat())?,
+            _ => run_capped(
+                &self.root,
+                &[&base[..], &["HEAD", "--", &path]].concat(),
+                MAX_DIFF_BYTES,
+            )?,
         };
         // --no-index exits 1 to mean "files differ", which is the expected outcome for untracked files.
         if !matches!(out.code, Some(0 | 1)) {
             return Err(out.error("git diff"));
         }
-        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        let mut stdout = out.stdout;
+        let truncated = stdout.len() as u64 > MAX_DIFF_BYTES;
+        stdout.truncate(MAX_DIFF_BYTES as usize);
+        let mut diff = String::from_utf8_lossy(&stdout).into_owned();
+        if truncated {
+            diff.push_str("\n… truncated at 1 MB");
+        }
+        Ok(diff)
     }
 }
 
@@ -317,6 +340,22 @@ pub mod tests {
         let status = Repo::discover(tmp.path()).unwrap().status().unwrap();
         assert_eq!(status.changes.get(Path::new("brief.txt")), None);
         assert!(status.phantoms.contains(Path::new("brief.txt")));
+    }
+
+    #[test]
+    fn huge_diffs_are_cut_at_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q"]);
+        let line = "x".repeat(99) + "\n";
+        write(dir, "big.txt", &line.repeat(30_000));
+
+        let diff = Repo::discover(dir)
+            .unwrap()
+            .diff(Path::new("big.txt"), &Change::Untracked)
+            .unwrap();
+        assert!(diff.ends_with("… truncated at 1 MB"));
+        assert!(diff.len() < MAX_DIFF_BYTES as usize + 100);
     }
 
     #[test]
