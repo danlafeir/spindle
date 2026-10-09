@@ -377,8 +377,25 @@ impl Review {
 }
 
 fn read_file(path: &Path) -> Content {
-    if path.is_dir() {
+    // A repo's files come from whoever wrote it, so a committed symlink is shown, not followed:
+    // one to /dev/tty would block the event loop forever, and one to ~/.ssh/config would put a
+    // file from outside the repo on screen.
+    let kind = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta.file_type(),
+        Err(e) => return Content::Message(format!("Can't read {}: {e}", path.display())),
+    };
+    if kind.is_symlink() {
+        let target = std::fs::read_link(path).map_or_else(
+            |e| format!("an unreadable target ({e})"),
+            |t| clean(&t.to_string_lossy()),
+        );
+        return Content::Message(format!("Symlink to {target}"));
+    }
+    if kind.is_dir() {
         return Content::Message("Submodule; nothing to show.".into());
+    }
+    if !kind.is_file() {
+        return Content::Message("Not a regular file; nothing to show.".into());
     }
     let mut bytes = Vec::new();
     let read = File::open(path).and_then(|f| f.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes));
@@ -541,6 +558,50 @@ mod tests {
                 change: Some(Change::Modified)
             }
         );
+    }
+
+    #[test]
+    fn symlinks_are_described_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink("/dev/tty", &link).unwrap();
+        assert!(
+            matches!(read_file(&link), Content::Message(m) if m == "Symlink to /dev/tty"),
+            "reading through it would block on the terminal"
+        );
+
+        std::fs::write(tmp.path().join("secret"), "outside the repo").unwrap();
+        let out = tmp.path().join("out");
+        std::os::unix::fs::symlink(tmp.path().join("secret"), &out).unwrap();
+        assert!(matches!(read_file(&out), Content::Message(m) if m.starts_with("Symlink to ")));
+    }
+
+    #[test]
+    fn special_files_are_not_opened() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("fifo");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        // Opening a FIFO with no writer would block forever.
+        assert!(matches!(
+            read_file(&fifo),
+            Content::Message(m) if m == "Not a regular file; nothing to show."
+        ));
+    }
+
+    #[test]
+    fn committed_symlink_selected_on_open_is_described() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::git::tests::git(tmp.path(), &["init", "-q"]);
+        std::os::unix::fs::symlink("/dev/tty", tmp.path().join("a")).unwrap();
+        crate::git::tests::git(tmp.path(), &["add", "."]);
+        crate::git::tests::git(tmp.path(), &["commit", "-q", "-m", "init"]);
+        let review = Review::open(tmp.path()).unwrap();
+        assert_eq!(review.selected().unwrap().path, Path::new("a"));
+        assert!(matches!(review.content(), Content::Message(m) if m == "Symlink to /dev/tty"));
     }
 
     #[test]
