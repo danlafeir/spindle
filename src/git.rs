@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
@@ -32,6 +32,13 @@ impl Change {
             Change::Untracked => '?',
         }
     }
+}
+
+pub struct Status {
+    pub changes: BTreeMap<PathBuf, Change>,
+    /// Staged as new and then deleted: in neither HEAD nor the working tree, so not a change,
+    /// but still in the index, where `ls-files` keeps listing them.
+    pub phantoms: BTreeSet<PathBuf>,
 }
 
 pub struct Repo {
@@ -100,8 +107,9 @@ fn nul_paths(bytes: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
         .map(|p| PathBuf::from(OsStr::from_bytes(p)))
 }
 
-fn parse_status(bytes: &[u8]) -> BTreeMap<PathBuf, Change> {
+fn parse_status(bytes: &[u8]) -> Status {
     let mut changes = BTreeMap::new();
+    let mut phantoms = BTreeSet::new();
     let mut entries = bytes.split(|&b| b == 0);
     while let Some(entry) = entries.next() {
         // Skips the empty field after the final NUL. Only entries are checked: a rename's
@@ -112,6 +120,10 @@ fn parse_status(bytes: &[u8]) -> BTreeMap<PathBuf, Change> {
         let (x, y) = (entry[0], entry[1]);
         let path = PathBuf::from(OsStr::from_bytes(&entry[3..]));
         let change = match (x, y) {
+            (b'A', b'D') => {
+                phantoms.insert(path);
+                continue;
+            }
             (b'?', b'?') => Change::Untracked,
             // -z puts a rename's or copy's source path in the next NUL-separated field.
             (b'R', _) | (b'C', _) => {
@@ -127,7 +139,7 @@ fn parse_status(bytes: &[u8]) -> BTreeMap<PathBuf, Change> {
         };
         changes.insert(path, change);
     }
-    changes
+    Status { changes, phantoms }
 }
 
 impl Repo {
@@ -144,7 +156,7 @@ impl Repo {
         &self.root
     }
 
-    pub fn changes(&self) -> Result<BTreeMap<PathBuf, Change>> {
+    pub fn status(&self) -> Result<Status> {
         let out = run(
             &self.root,
             &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
@@ -257,7 +269,7 @@ pub mod tests {
     fn changes_cover_every_kind_vs_head() {
         let tmp = fixture();
         let repo = Repo::discover(&tmp.path().join("src")).unwrap();
-        let changes = repo.changes().unwrap();
+        let changes = repo.status().unwrap().changes;
         let get = |p: &str| changes.get(Path::new(p)).cloned();
 
         assert_eq!(get("mod.txt"), Some(Change::Modified));
@@ -287,12 +299,24 @@ pub mod tests {
         git(dir, &["mv", "a.c", "b.c"]);
         write(dir, "mod.txt", "changed\n");
 
-        let changes = Repo::discover(dir).unwrap().changes().unwrap();
+        let changes = Repo::discover(dir).unwrap().status().unwrap().changes;
         assert_eq!(
             changes.get(Path::new("b.c")),
             Some(&Change::Renamed { from: "a.c".into() })
         );
         assert_eq!(changes.get(Path::new("mod.txt")), Some(&Change::Modified));
+    }
+
+    #[test]
+    fn added_then_deleted_is_not_a_change() {
+        let tmp = fixture();
+        write(tmp.path(), "brief.txt", "x\n");
+        git(tmp.path(), &["add", "brief.txt"]);
+        fs::remove_file(tmp.path().join("brief.txt")).unwrap();
+
+        let status = Repo::discover(tmp.path()).unwrap().status().unwrap();
+        assert_eq!(status.changes.get(Path::new("brief.txt")), None);
+        assert!(status.phantoms.contains(Path::new("brief.txt")));
     }
 
     #[test]
@@ -328,7 +352,7 @@ pub mod tests {
     fn diffs_each_kind_of_change() {
         let tmp = fixture();
         let repo = Repo::discover(tmp.path()).unwrap();
-        let changes = repo.changes().unwrap();
+        let changes = repo.status().unwrap().changes;
         let diff = |p: &str| repo.diff(Path::new(p), &changes[Path::new(p)]).unwrap();
 
         assert!(diff("mod.txt").contains("+changed"));

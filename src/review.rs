@@ -195,10 +195,12 @@ impl Review {
     }
 
     fn load(&mut self) -> Result<()> {
-        let changes = self.repo.changes()?;
+        let status = self.repo.status()?;
+        let changes = status.changes;
         // Staged deletions are gone from ls-files but still need a row.
         let mut files: BTreeSet<PathBuf> = self.repo.files()?.into_iter().collect();
         files.extend(changes.keys().cloned());
+        files.retain(|f| !status.phantoms.contains(f));
 
         let mut tree = Node::default();
         for f in &files {
@@ -506,6 +508,16 @@ mod tests {
         assert_eq!(names(&review)[1], "  dir file.txt", "and unfolds");
         review.click(99);
         assert_eq!(review.selected().unwrap().path, Path::new("src"));
+    }
+
+    #[test]
+    fn added_then_deleted_files_leave_the_tree() {
+        let tmp = fixture();
+        crate::git::tests::write(tmp.path(), "brief.txt", "x\n");
+        crate::git::tests::git(tmp.path(), &["add", "brief.txt"]);
+        std::fs::remove_file(tmp.path().join("brief.txt")).unwrap();
+        let review = Review::open(tmp.path()).unwrap();
+        assert!(!names(&review).iter().any(|n| n.contains("brief.txt")));
     }
 
     #[test]
