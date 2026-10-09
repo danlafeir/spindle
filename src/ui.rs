@@ -461,7 +461,7 @@ mod tests {
     #[test]
     fn renders_review_view_over_the_pane() {
         let tmp = crate::git::tests::fixture();
-        let review = Review::open(tmp.path()).unwrap();
+        let (review, _rx) = crate::review::tests::open(tmp.path());
         let area = Rect::new(0, 0, 100, 20);
 
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
@@ -556,7 +556,7 @@ mod tests {
     #[test]
     fn clicks_on_tree_rows_hit_the_row_drawn_there_even_when_scrolled() {
         let tmp = crate::git::tests::fixture();
-        let mut review = Review::open(tmp.path()).unwrap();
+        let (mut review, _rx) = crate::review::tests::open(tmp.path());
         // A pane so short the tree has to scroll to keep the cursor in view.
         let area = Rect::new(0, 0, 100, 6);
         review.handle(crate::review::Key::Bottom, 1);
@@ -602,10 +602,11 @@ mod tests {
     fn file_contents_never_reach_the_buffer_as_escapes() {
         let tmp = crate::git::tests::fixture();
         crate::git::tests::write(tmp.path(), "keep.txt", "evil \x1b[31m\tline\n");
-        let mut review = Review::open(tmp.path()).unwrap();
+        let (mut review, rx) = crate::review::tests::open(tmp.path());
         while review.selected().unwrap().path != std::path::Path::new("keep.txt") {
             review.handle(crate::review::Key::Down, 1);
         }
+        crate::review::tests::settle(&mut review, &rx);
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
         terminal
             .draw(|f| draw(f, &sidebar(1), &[], &View::Review(Box::new(review))))
@@ -621,7 +622,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         crate::git::tests::git(tmp.path(), &["init", "-q"]);
         crate::git::tests::write(tmp.path(), "evil\x1b]0;pwned\x07.txt", "x\n");
-        let review = Review::open(tmp.path()).unwrap();
+        let (review, _rx) = crate::review::tests::open(tmp.path());
         assert!(review.selected().unwrap().name().contains("pwned"));
 
         let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();

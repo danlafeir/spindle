@@ -46,7 +46,7 @@ spindle captures the mouse, so dragging no longer selects text. In Terminal.app,
 | `r` | Reload from git |
 | `q` or `Esc` | Back to the shell |
 
-The review shows the repo spindle was launched in, not wherever the shell has since `cd`'d to.
+The review shows the repo spindle was launched in, not wherever the shell has since `cd`'d to. The tree and each file's diff load in the background, so a large repo shows *Loading…* for a moment rather than freezing your shells.
 
 ## Try it
 

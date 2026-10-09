@@ -20,6 +20,7 @@ pub enum Event {
     Exited(PaneId),
     Resize,
     Keys(Vec<u8>),
+    Review(crate::review::Update),
 }
 
 struct Pane {

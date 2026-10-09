@@ -3,6 +3,9 @@ use std::ffi::OsString;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
 
 use anyhow::Result;
 
@@ -10,6 +13,7 @@ use crate::git::{Change, Repo};
 
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 const TAB_WIDTH: usize = 4;
+const LOADING: &str = "Loading…";
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Key {
@@ -127,8 +131,104 @@ pub enum Outcome {
     Close,
 }
 
+/// Everything the tree is built from, loaded off the event loop.
+struct Tree {
+    root: Node,
+    changes: BTreeMap<PathBuf, Change>,
+    changed_dirs: HashSet<PathBuf>,
+}
+
+fn load_tree(repo: &Repo) -> Result<Tree> {
+    let status = repo.status()?;
+    let changes = status.changes;
+    // Staged deletions are gone from ls-files but still need a row.
+    let mut files: BTreeSet<PathBuf> = repo.files()?.into_iter().collect();
+    files.extend(changes.keys().cloned());
+    files.retain(|f| !status.phantoms.contains(f));
+
+    let mut root = Node::default();
+    for f in &files {
+        root.insert(f);
+    }
+    let changed_dirs = changes
+        .keys()
+        .flat_map(|p| p.ancestors().skip(1))
+        .filter(|a| !a.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .collect();
+    Ok(Tree {
+        root,
+        changes,
+        changed_dirs,
+    })
+}
+
+fn load_content(repo: &Repo, path: &Path, change: Option<&Change>) -> Content {
+    match change {
+        Some(change) => match repo.diff(path, change) {
+            Ok(diff) => Content::Diff(diff.lines().map(clean).collect()),
+            Err(e) => Content::Message(format!("{e:#}")),
+        },
+        None => read_file(&repo.root().join(path)),
+    }
+}
+
+enum Job {
+    Tree {
+        seq: u64,
+    },
+    Content {
+        seq: u64,
+        path: PathBuf,
+        change: Option<Change>,
+    },
+}
+
+/// A result from a review's worker, to hand back to [`Review::apply`].
+pub struct Update {
+    review: u64,
+    seq: u64,
+    kind: UpdateKind,
+}
+
+enum UpdateKind {
+    Tree(Result<Tree, String>),
+    Content(Content),
+}
+
+/// Runs git and file reads for one review. Only the newest job of each kind in the queue is
+/// done, so holding `j` diffs the row the cursor stops on, not every row it passes.
+fn work(repo: Repo, review: u64, jobs: Receiver<Job>, notify: impl Fn(Update)) {
+    while let Ok(first) = jobs.recv() {
+        let (mut tree, mut content) = (None, None);
+        for job in std::iter::once(first).chain(jobs.try_iter()) {
+            match job {
+                Job::Tree { seq } => tree = Some(seq),
+                job @ Job::Content { .. } => content = Some(job),
+            }
+        }
+        if let Some(seq) = tree {
+            let kind = UpdateKind::Tree(load_tree(&repo).map_err(|e| format!("{e:#}")));
+            notify(Update { review, seq, kind });
+        }
+        if let Some(Job::Content { seq, path, change }) = content {
+            let kind = UpdateKind::Content(load_content(&repo, &path, change.as_ref()));
+            notify(Update { review, seq, kind });
+        }
+    }
+}
+
+// Tells apart reviews opened one after another, so a closed review's late results are ignored.
+static NEXT_REVIEW: AtomicU64 = AtomicU64::new(0);
+
 pub struct Review {
-    repo: Repo,
+    id: u64,
+    root: PathBuf,
+    jobs: Sender<Job>,
+    next_seq: u64,
+    tree_pending: Option<u64>,
+    content_pending: Option<u64>,
+    loaded: bool,
     tree: Node,
     changes: BTreeMap<PathBuf, Change>,
     changed_dirs: HashSet<PathBuf>,
@@ -140,36 +240,108 @@ pub struct Review {
 }
 
 impl Review {
-    /// Opens the repo containing `dir` with every folder that holds a change expanded and the
-    /// cursor on the first changed file.
-    pub fn open(dir: &Path) -> Result<Review> {
+    /// Opens the repo containing `dir`. The tree loads in the background, arriving through
+    /// `notify` for [`Review::apply`]; it opens with every folder that holds a change expanded
+    /// and the cursor on the first changed file.
+    pub fn open(dir: &Path, notify: impl Fn(Update) + Send + 'static) -> Result<Review> {
         let repo = Repo::discover(dir)?;
+        let id = NEXT_REVIEW.fetch_add(1, Ordering::Relaxed);
+        let root = repo.root().to_path_buf();
+        let (jobs, jobs_rx) = mpsc::channel();
+        // Ends once the review is dropped and its job queue closes.
+        thread::spawn(move || work(repo, id, jobs_rx, notify));
         let mut review = Review {
-            repo,
+            id,
+            root,
+            jobs,
+            next_seq: 0,
+            tree_pending: None,
+            content_pending: None,
+            loaded: false,
             tree: Node::default(),
             changes: BTreeMap::new(),
             changed_dirs: HashSet::new(),
             open_dirs: HashSet::new(),
             rows: Vec::new(),
             cursor: 0,
-            content: Content::Message(String::new()),
+            content: Content::Message(LOADING.into()),
             scroll: 0,
         };
-        review.load()?;
-        review.open_dirs = review.changed_dirs.clone();
-        review.rebuild_rows();
-        review.cursor = review
-            .rows
-            .iter()
-            .position(|r| matches!(r.kind, RowKind::File { change: Some(_) }))
-            .unwrap_or(0);
-        review.select();
+        review.request_tree();
         Ok(review)
     }
 
+    fn next_seq(&mut self) -> u64 {
+        self.next_seq += 1;
+        self.next_seq
+    }
+
+    fn request_tree(&mut self) {
+        let seq = self.next_seq();
+        self.tree_pending = Some(seq);
+        // The worker only stops once this review is dropped, so the send can't fail.
+        let _ = self.jobs.send(Job::Tree { seq });
+    }
+
+    /// True while a load is outstanding.
+    #[cfg(test)]
+    pub fn busy(&self) -> bool {
+        self.tree_pending.is_some() || self.content_pending.is_some()
+    }
+
+    /// Takes in a worker result. Results for another review, or overtaken by a newer request,
+    /// are dropped.
+    pub fn apply(&mut self, update: Update) {
+        if update.review != self.id {
+            return;
+        }
+        match update.kind {
+            UpdateKind::Tree(tree) => {
+                if self.tree_pending != Some(update.seq) {
+                    return;
+                }
+                self.tree_pending = None;
+                let tree = match tree {
+                    Ok(tree) => tree,
+                    Err(e) => {
+                        self.content_pending = None;
+                        self.content = Content::Message(e);
+                        return;
+                    }
+                };
+                let selected = self.selected().map(|r| r.path.clone());
+                self.tree = tree.root;
+                self.changes = tree.changes;
+                self.changed_dirs = tree.changed_dirs;
+                if !self.loaded {
+                    self.loaded = true;
+                    self.open_dirs = self.changed_dirs.clone();
+                    self.rebuild_rows();
+                    self.cursor = self
+                        .rows
+                        .iter()
+                        .position(|r| matches!(r.kind, RowKind::File { change: Some(_) }))
+                        .unwrap_or(0);
+                } else {
+                    self.rebuild_rows();
+                    self.cursor = selected
+                        .and_then(|p| self.rows.iter().position(|r| r.path == p))
+                        .unwrap_or(self.cursor)
+                        .min(self.rows.len().saturating_sub(1));
+                }
+                self.select();
+            }
+            UpdateKind::Content(content) => {
+                if self.content_pending == Some(update.seq) {
+                    self.content_pending = None;
+                    self.content = content;
+                }
+            }
+        }
+    }
+
     pub fn root_name(&self) -> String {
-        self.repo
-            .root()
+        self.root
             .file_name()
             .map_or_else(|| "/".into(), |n| n.to_string_lossy().into_owned())
     }
@@ -192,29 +364,6 @@ impl Review {
 
     pub fn selected(&self) -> Option<&Row> {
         self.rows.get(self.cursor)
-    }
-
-    fn load(&mut self) -> Result<()> {
-        let status = self.repo.status()?;
-        let changes = status.changes;
-        // Staged deletions are gone from ls-files but still need a row.
-        let mut files: BTreeSet<PathBuf> = self.repo.files()?.into_iter().collect();
-        files.extend(changes.keys().cloned());
-        files.retain(|f| !status.phantoms.contains(f));
-
-        let mut tree = Node::default();
-        for f in &files {
-            tree.insert(f);
-        }
-        self.changed_dirs = changes
-            .keys()
-            .flat_map(|p| p.ancestors().skip(1))
-            .filter(|a| !a.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .collect();
-        self.tree = tree;
-        self.changes = changes;
-        Ok(())
     }
 
     fn rebuild_rows(&mut self) {
@@ -252,29 +401,30 @@ impl Review {
 
     fn select(&mut self) {
         self.scroll = 0;
-        self.content = match self.rows.get(self.cursor) {
-            None => Content::Message("No files.".into()),
+        self.content_pending = None;
+        let (path, change) = match self.rows.get(self.cursor) {
+            None => {
+                self.content = Content::Message("No files.".into());
+                return;
+            }
             Some(Row {
                 kind: RowKind::Dir { .. },
                 path,
                 ..
-            }) => Content::Message(format!("{}/", path.display())),
+            }) => {
+                self.content = Content::Message(format!("{}/", path.display()));
+                return;
+            }
             Some(Row {
-                kind: RowKind::File {
-                    change: Some(change),
-                },
+                kind: RowKind::File { change },
                 path,
                 ..
-            }) => match self.repo.diff(path, change) {
-                Ok(diff) => Content::Diff(diff.lines().map(clean).collect()),
-                Err(e) => Content::Message(format!("{e:#}")),
-            },
-            Some(Row {
-                kind: RowKind::File { change: None },
-                path,
-                ..
-            }) => read_file(&self.repo.root().join(path)),
+            }) => (path.clone(), change.clone()),
         };
+        let seq = self.next_seq();
+        self.content_pending = Some(seq);
+        self.content = Content::Message(LOADING.into());
+        let _ = self.jobs.send(Job::Content { seq, path, change });
     }
 
     fn move_to(&mut self, cursor: usize) {
@@ -304,20 +454,6 @@ impl Review {
             self.open_dirs.remove(&path);
         }
         self.rebuild_rows();
-    }
-
-    fn refresh(&mut self) {
-        let selected = self.selected().map(|r| r.path.clone());
-        if let Err(e) = self.load() {
-            self.content = Content::Message(format!("{e:#}"));
-            return;
-        }
-        self.rebuild_rows();
-        self.cursor = selected
-            .and_then(|p| self.rows.iter().position(|r| r.path == p))
-            .unwrap_or(self.cursor)
-            .min(self.rows.len().saturating_sub(1));
-        self.select();
     }
 
     /// Selects `row` the way a mouse click would: a folder also toggles open or closed.
@@ -370,7 +506,7 @@ impl Review {
                 self.scroll = (self.scroll + page).min(len.saturating_sub(1));
             }
             Key::ScrollUp => self.scroll = self.scroll.saturating_sub(page),
-            Key::Refresh => self.refresh(),
+            Key::Refresh => self.request_tree(),
         }
         Outcome::Stay
     }
@@ -441,9 +577,30 @@ pub fn clean(line: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use crate::git::tests::{fixture, write};
+    use std::time::Duration;
+
+    /// Opens a review and waits for its first load, as a user would see it once settled.
+    pub fn open(dir: &Path) -> (Review, Receiver<Update>) {
+        let (tx, rx) = mpsc::channel();
+        let mut review = Review::open(dir, move |u| {
+            let _ = tx.send(u);
+        })
+        .unwrap();
+        settle(&mut review, &rx);
+        (review, rx)
+    }
+
+    pub fn settle(review: &mut Review, rx: &Receiver<Update>) {
+        while review.busy() {
+            let update = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the worker never answered");
+            review.apply(update);
+        }
+    }
 
     fn names(review: &Review) -> Vec<String> {
         review
@@ -466,7 +623,7 @@ mod tests {
     #[test]
     fn opens_with_changes_expanded_and_first_change_selected() {
         let tmp = fixture();
-        let review = Review::open(tmp.path()).unwrap();
+        let (review, _rx) = open(tmp.path());
         assert_eq!(
             names(&review),
             [
@@ -493,7 +650,7 @@ mod tests {
     #[test]
     fn folding_and_navigation() {
         let tmp = fixture();
-        let mut review = Review::open(tmp.path()).unwrap();
+        let (mut review, rx) = open(tmp.path());
         review.handle(Key::Left, 10);
         assert_eq!(review.selected().unwrap().path, Path::new("src"));
         review.handle(Key::Left, 10);
@@ -510,13 +667,14 @@ mod tests {
         review.handle(Key::Up, 10);
         review.handle(Key::Up, 10);
         assert_eq!(review.selected().unwrap().path, Path::new("keep.txt"));
+        settle(&mut review, &rx);
         assert!(matches!(review.content(), Content::File(l) if l == &["keep.txt"]));
     }
 
     #[test]
     fn clicks_select_files_and_toggle_folders() {
         let tmp = fixture();
-        let mut review = Review::open(tmp.path()).unwrap();
+        let (mut review, _rx) = open(tmp.path());
         review.click(5);
         assert_eq!(review.selected().unwrap().path, Path::new("keep.txt"));
         review.click(0);
@@ -533,16 +691,59 @@ mod tests {
         crate::git::tests::write(tmp.path(), "brief.txt", "x\n");
         crate::git::tests::git(tmp.path(), &["add", "brief.txt"]);
         std::fs::remove_file(tmp.path().join("brief.txt")).unwrap();
-        let review = Review::open(tmp.path()).unwrap();
+        let (review, _rx) = open(tmp.path());
         assert!(!names(&review).iter().any(|n| n.contains("brief.txt")));
+    }
+
+    #[test]
+    fn opening_returns_before_the_tree_loads() {
+        let tmp = fixture();
+        let (tx, _rx) = mpsc::channel();
+        let review = Review::open(tmp.path(), move |u| {
+            let _ = tx.send(u);
+        })
+        .unwrap();
+        assert!(review.rows().is_empty());
+        assert!(matches!(review.content(), Content::Message(m) if m == LOADING));
+    }
+
+    #[test]
+    fn only_the_row_the_cursor_stops_on_is_shown() {
+        let tmp = fixture();
+        let (mut review, rx) = open(tmp.path());
+        for _ in 0..5 {
+            review.handle(Key::Down, 10);
+        }
+        settle(&mut review, &rx);
+        assert_eq!(review.selected().unwrap().path, Path::new("mod.txt"));
+        assert!(
+            matches!(review.content(), Content::Diff(l) if l.iter().any(|l| l == "+changed")),
+            "an earlier row's diff arriving late must not replace this one"
+        );
+    }
+
+    #[test]
+    fn a_closed_reviews_late_results_are_ignored() {
+        let tmp = fixture();
+        let (old, old_rx) = open(tmp.path());
+        let (mut new, _rx) = open(tmp.path());
+        let rows = new.rows().len();
+        write(tmp.path(), "late.txt", "x\n");
+        // Ask the old review for a fresh tree, then feed its answer to the new one.
+        let mut old = old;
+        old.handle(Key::Refresh, 10);
+        let update = old_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        new.apply(update);
+        assert_eq!(new.rows().len(), rows);
     }
 
     #[test]
     fn refresh_picks_up_new_changes_and_keeps_selection() {
         let tmp = fixture();
-        let mut review = Review::open(tmp.path()).unwrap();
+        let (mut review, rx) = open(tmp.path());
         write(tmp.path(), "keep.txt", "edited\n");
         review.handle(Key::Refresh, 10);
+        settle(&mut review, &rx);
         assert_eq!(
             review.selected().unwrap().path,
             Path::new("src/dir file.txt")
@@ -599,7 +800,7 @@ mod tests {
         std::os::unix::fs::symlink("/dev/tty", tmp.path().join("a")).unwrap();
         crate::git::tests::git(tmp.path(), &["add", "."]);
         crate::git::tests::git(tmp.path(), &["commit", "-q", "-m", "init"]);
-        let review = Review::open(tmp.path()).unwrap();
+        let (review, _rx) = open(tmp.path());
         assert_eq!(review.selected().unwrap().path, Path::new("a"));
         assert!(matches!(review.content(), Content::Message(m) if m == "Symlink to /dev/tty"));
     }

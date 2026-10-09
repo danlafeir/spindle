@@ -89,6 +89,7 @@ fn run() -> Result<ExitCode> {
         }
     });
 
+    let review_tx = tx.clone();
     let mut winch = Signals::new([SIGWINCH])?;
     // Waits on signals forever; like the stdin thread, it ends with the process.
     thread::spawn(move || {
@@ -144,6 +145,12 @@ fn run() -> Result<ExitCode> {
                     term.autoresize()?;
                     let size = term.size()?;
                     session.resize(ui::layout(Rect::new(0, 0, size.width, size.height)).pane)?;
+                    Vec::new()
+                }
+                Some(Event::Review(update)) => {
+                    if let ui::View::Review(review) = &mut view {
+                        review.apply(update);
+                    }
                     Vec::new()
                 }
                 Some(Event::Exited(id)) => {
@@ -238,7 +245,13 @@ fn run() -> Result<ExitCode> {
                     }
                     input::Action::ToggleReview => {
                         view = match view {
-                            ui::View::Shell => match review::Review::open(&launch_dir) {
+                            ui::View::Shell => match review::Review::open(&launch_dir, {
+                                let tx = review_tx.clone();
+                                // Fails only once the loop has ended and nothing is left to show it.
+                                move |update| {
+                                    let _ = tx.send(Event::Review(update));
+                                }
+                            }) {
                                 Ok(review) => ui::View::Review(Box::new(review)),
                                 Err(e) => ui::View::Unavailable(format!("{e:#}")),
                             },
