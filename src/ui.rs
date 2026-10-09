@@ -9,6 +9,7 @@ use crate::git::Change;
 use crate::review::{Content, Review, Row, RowKind};
 
 const SIDEBAR_WIDTH: u16 = 26;
+const MENU_HEIGHT: u16 = 3;
 
 pub enum View {
     Shell,
@@ -30,8 +31,42 @@ pub fn layout(area: Rect) -> Areas {
     Areas {
         sidebar,
         pane,
-        pane_inner: Block::bordered().inner(pane),
+        pane_inner: pane_inner(pane),
     }
+}
+
+/// Where a pane's terminal is drawn inside its border, and so the size its PTY must be.
+pub fn pane_inner(pane: Rect) -> Rect {
+    Block::bordered().inner(pane)
+}
+
+pub struct PaneView<'a> {
+    pub area: Rect,
+    pub screen: &'a vt100::Screen,
+    pub focused: bool,
+}
+
+pub struct Sidebar {
+    pub workspaces: usize,
+    pub active: usize,
+    /// Every workspace starts in the launch directory, so they share its name.
+    pub dir: String,
+}
+
+struct SidebarAreas {
+    menu: Rect,
+    rule: Rect,
+    lists: Rect,
+}
+
+fn sidebar_areas(sidebar: Rect) -> SidebarAreas {
+    let [menu, rule, lists] = Layout::vertical([
+        Constraint::Length(MENU_HEIGHT),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(Block::bordered().inner(sidebar));
+    SidebarAreas { menu, rule, lists }
 }
 
 /// How far one scroll key moves the review content: half its visible height.
@@ -75,26 +110,23 @@ fn tree_offset(review: &Review, height: u16) -> usize {
         .saturating_sub((height as usize).saturating_sub(1))
 }
 
-fn menu_area(sidebar: Rect) -> Rect {
-    let inner = Block::bordered().inner(sidebar);
-    Rect {
-        height: inner.height.min(2),
-        ..inner
-    }
-}
-
 pub enum Hit {
     MenuKey(u8),
+    Workspace(usize),
     TreeRow(usize),
     ReviewPane,
     Nothing,
 }
 
 /// What lies under screen cell (`col`, `row`).
-pub fn hit(screen: Rect, view: &View, col: u16, row: u16) -> Hit {
+pub fn hit(screen: Rect, view: &View, sidebar: &Sidebar, col: u16, row: u16) -> Hit {
     let areas = layout(screen);
     let pos = ratatui::layout::Position::new(col, row);
-    let menu = menu_area(areas.sidebar);
+    let SidebarAreas { menu, lists, .. } = sidebar_areas(areas.sidebar);
+    // The workspace rows sit under the WORKSPACES header.
+    if lists.contains(pos) && row > lists.y && ((row - lists.y - 1) as usize) < sidebar.workspaces {
+        return Hit::Workspace((row - lists.y - 1) as usize);
+    }
     if menu.contains(pos) {
         let line = &menu_lines()[(row - menu.y) as usize];
         let mut x = menu.x;
@@ -125,29 +157,29 @@ pub fn hit(screen: Rect, view: &View, col: u16, row: u16) -> Hit {
     Hit::ReviewPane
 }
 
-pub fn draw(frame: &mut Frame, screen: &vt100::Screen, view: &View) {
+pub fn draw(frame: &mut Frame, sidebar: &Sidebar, panes: &[PaneView], view: &View) {
     let areas = layout(frame.area());
 
-    let sidebar = Block::bordered().title(" spindle ");
-    let inner = sidebar.inner(areas.sidebar);
-    frame.render_widget(sidebar, areas.sidebar);
-
-    let [_, rule, body] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(1),
-        Constraint::Min(0),
-    ])
-    .areas(inner);
-    let menu = menu_area(areas.sidebar);
+    frame.render_widget(Block::bordered().title(" spindle "), areas.sidebar);
+    let SidebarAreas { menu, rule, lists } = sidebar_areas(areas.sidebar);
     frame.render_widget(Paragraph::new(menu_lines()), menu);
     frame.render_widget(Block::new().borders(Borders::TOP).dark_gray(), rule);
-    frame.render_widget(Paragraph::new(placeholder_lists()), body);
+    frame.render_widget(Paragraph::new(sidebar_lists(sidebar)), lists);
 
     match view {
-        View::Shell => frame.render_widget(
-            PseudoTerminal::new(screen).block(Block::bordered()),
-            areas.pane,
-        ),
+        View::Shell => {
+            for pane in panes {
+                let border = if pane.focused {
+                    Style::new().fg(Color::Cyan)
+                } else {
+                    Style::new()
+                };
+                frame.render_widget(
+                    PseudoTerminal::new(pane.screen).block(Block::bordered().border_style(border)),
+                    pane.area,
+                );
+            }
+        }
         View::Review(review) => draw_review(frame, areas.pane, review),
         View::Unavailable(msg) => frame.render_widget(
             Paragraph::new(vec![
@@ -156,7 +188,7 @@ pub fn draw(frame: &mut Frame, screen: &vt100::Screen, view: &View) {
                 Line::from("Press q or Esc to go back.").dark_gray(),
             ])
             .wrap(Wrap { trim: false })
-            .block(Block::bordered().title(" review ")),
+            .block(Block::bordered()),
             areas.pane,
         ),
     }
@@ -171,8 +203,15 @@ fn menu_lines() -> Vec<Line<'static>> {
             Span::raw("^b ").dark_gray(),
             key("n"),
             Span::raw(" new  "),
+            key("x"),
+            Span::raw(" close"),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
             key("s"),
-            Span::raw(" split"),
+            Span::raw(" split  "),
+            key("S"),
+            Span::raw(" stack"),
         ]),
         Line::from(vec![
             Span::raw("   "),
@@ -306,8 +345,7 @@ fn content_paragraph(review: &Review, height: usize) -> Paragraph<'_> {
     Paragraph::new(lines)
 }
 
-// Static stand-ins until workspaces and agent detection exist.
-fn placeholder_lists() -> Vec<Line<'static>> {
+fn sidebar_lists(sidebar: &Sidebar) -> Vec<Line<'static>> {
     let header = |s: &'static str| Line::from(s).bold().dark_gray();
     let agent = |dot: &'static str, name: &'static str, state: &'static str, color: Color| {
         Line::from(vec![
@@ -316,16 +354,24 @@ fn placeholder_lists() -> Vec<Line<'static>> {
             Span::styled(state, Style::new().fg(color)),
         ])
     };
-    vec![
-        header("WORKSPACES"),
-        Line::from("▸ spindle").bold(),
-        Line::from("  dotfiles"),
+    let mut lines = vec![header("WORKSPACES")];
+    lines.extend((0..sidebar.workspaces).map(|i| {
+        let label = format!("{} {}", i + 1, sidebar.dir);
+        if i == sidebar.active {
+            Line::from(format!("▸ {label}")).bold()
+        } else {
+            Line::from(format!("  {label}"))
+        }
+    }));
+    // Static stand-ins until agent detection exists.
+    lines.extend([
         Line::from(""),
         header("AGENTS"),
         agent("●", "claude", "working", Color::Green),
         agent("◐", "codex", "blocked", Color::Yellow),
         agent("○", "shell", "idle", Color::DarkGray),
-    ]
+    ]);
+    lines
 }
 
 #[cfg(test)]
@@ -336,6 +382,14 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::io::Read;
+
+    fn sidebar(workspaces: usize) -> Sidebar {
+        Sidebar {
+            workspaces,
+            active: 0,
+            dir: "spindle".into(),
+        }
+    }
 
     fn row(buf: &ratatui::buffer::Buffer, y: u16) -> String {
         (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect()
@@ -363,26 +417,39 @@ mod tests {
 
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         terminal
-            .draw(|f| draw(f, parser.screen(), &View::Shell))
+            .draw(|f| {
+                draw(
+                    f,
+                    &sidebar(1),
+                    &[PaneView {
+                        area: layout(area).pane,
+                        screen: parser.screen(),
+                        focused: false,
+                    }],
+                    &View::Shell,
+                )
+            })
             .unwrap();
         let buf = terminal.backend().buffer();
         let rows: Vec<String> = (0..area.height).map(|y| row(buf, y)).collect();
         println!("{}", rows.join("\n"));
 
-        let sidebar = |y: usize| {
+        let sidebar_row = |y: usize| {
             rows[y][..]
                 .chars()
                 .take(SIDEBAR_WIDTH as usize)
                 .collect::<String>()
         };
-        assert!(sidebar(0).contains("spindle"));
+        assert!(sidebar_row(0).contains("spindle"));
         assert!(
-            sidebar(1).contains("^b n new  s split"),
+            sidebar_row(1).contains("^b n new  x close"),
             "menu must be the first sidebar row"
         );
-        assert!(sidebar(2).contains("g review q quit"));
-        assert!(sidebar(4).contains("WORKSPACES"));
-        assert!(rows.iter().position(|r| r.contains("AGENTS")).unwrap() > 4);
+        assert!(sidebar_row(2).contains("s split  S stack"));
+        assert!(sidebar_row(3).contains("g review q quit"));
+        assert!(sidebar_row(5).contains("WORKSPACES"));
+        assert!(sidebar_row(6).contains("▸ 1 spindle"));
+        assert!(rows.iter().position(|r| r.contains("AGENTS")).unwrap() > 6);
 
         let pane_row: String = rows[inner.y as usize]
             .chars()
@@ -396,11 +463,10 @@ mod tests {
         let tmp = crate::git::tests::fixture();
         let review = Review::open(tmp.path()).unwrap();
         let area = Rect::new(0, 0, 100, 20);
-        let parser = vt100::Parser::new(1, 1, 0);
 
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         terminal
-            .draw(|f| draw(f, parser.screen(), &View::Review(Box::new(review))))
+            .draw(|f| draw(f, &sidebar(1), &[], &View::Review(Box::new(review))))
             .unwrap();
         let buf = terminal.backend().buffer();
         let rows: Vec<String> = (0..area.height).map(|y| row(buf, y)).collect();
@@ -435,13 +501,24 @@ mod tests {
         let parser = vt100::Parser::new(1, 1, 0);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
         terminal
-            .draw(|f| draw(f, parser.screen(), &View::Shell))
+            .draw(|f| {
+                draw(
+                    f,
+                    &sidebar(1),
+                    &[PaneView {
+                        area: layout(area).pane,
+                        screen: parser.screen(),
+                        focused: false,
+                    }],
+                    &View::Shell,
+                )
+            })
             .unwrap();
         let rows: Vec<String> = (0..area.height)
             .map(|y| row(terminal.backend().buffer(), y))
             .collect();
 
-        let key_at = |(x, y): (u16, u16)| match hit(area, &View::Shell, x, y) {
+        let key_at = |(x, y): (u16, u16)| match hit(area, &View::Shell, &sidebar(1), x, y) {
             Hit::MenuKey(k) => Some(k as char),
             _ => None,
         };
@@ -456,6 +533,27 @@ mod tests {
     }
 
     #[test]
+    fn clicks_on_workspace_rows_hit_that_workspace() {
+        let area = Rect::new(0, 0, 80, 24);
+        let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+        terminal
+            .draw(|f| draw(f, &sidebar(2), &[], &View::Shell))
+            .unwrap();
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| row(terminal.backend().buffer(), y))
+            .collect();
+        let at = |(x, y): (u16, u16)| match hit(area, &View::Shell, &sidebar(2), x, y) {
+            Hit::Workspace(i) => Some(i),
+            _ => None,
+        };
+        assert_eq!(at(find(&rows, "1 spindle")), Some(0));
+        assert_eq!(at(find(&rows, "2 spindle")), Some(1));
+        assert_eq!(at(find(&rows, "WORKSPACES")), None);
+        let (x, y) = find(&rows, "2 spindle");
+        assert_eq!(at((x, y + 1)), None, "blank row after the list");
+    }
+
+    #[test]
     fn clicks_on_tree_rows_hit_the_row_drawn_there_even_when_scrolled() {
         let tmp = crate::git::tests::fixture();
         let mut review = Review::open(tmp.path()).unwrap();
@@ -463,9 +561,8 @@ mod tests {
         let area = Rect::new(0, 0, 100, 6);
         review.handle(crate::review::Key::Bottom, 1);
         let view = View::Review(Box::new(review));
-        let parser = vt100::Parser::new(1, 1, 0);
         let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
-        terminal.draw(|f| draw(f, parser.screen(), &view)).unwrap();
+        terminal.draw(|f| draw(f, &sidebar(1), &[], &view)).unwrap();
         let rows: Vec<String> = (0..area.height)
             .map(|y| row(terminal.backend().buffer(), y))
             .collect();
@@ -481,7 +578,7 @@ mod tests {
             "tree should be scrolled"
         );
         for y in tree.y..tree.bottom() {
-            let Hit::TreeRow(i) = hit(area, &view, tree.x + 1, y) else {
+            let Hit::TreeRow(i) = hit(area, &view, &sidebar(1), tree.x + 1, y) else {
                 panic!("row {y} isn't a tree row");
             };
             let drawn: String = rows[y as usize]
@@ -495,7 +592,10 @@ mod tests {
             );
         }
         let body = review_areas(inner).body;
-        assert!(matches!(hit(area, &view, body.x, body.y), Hit::ReviewPane));
+        assert!(matches!(
+            hit(area, &view, &sidebar(1), body.x, body.y),
+            Hit::ReviewPane
+        ));
     }
 
     #[test]
@@ -507,9 +607,8 @@ mod tests {
             review.handle(crate::review::Key::Down, 1);
         }
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).unwrap();
-        let parser = vt100::Parser::new(1, 1, 0);
         terminal
-            .draw(|f| draw(f, parser.screen(), &View::Review(Box::new(review))))
+            .draw(|f| draw(f, &sidebar(1), &[], &View::Review(Box::new(review))))
             .unwrap();
         let buf = terminal.backend().buffer();
         let text: String = (0..20).map(|y| row(buf, y)).collect();
@@ -526,9 +625,8 @@ mod tests {
         assert!(review.selected().unwrap().name().contains("pwned"));
 
         let mut terminal = Terminal::new(TestBackend::new(100, 10)).unwrap();
-        let parser = vt100::Parser::new(1, 1, 0);
         terminal
-            .draw(|f| draw(f, parser.screen(), &View::Review(Box::new(review))))
+            .draw(|f| draw(f, &sidebar(1), &[], &View::Review(Box::new(review))))
             .unwrap();
         let buf = terminal.backend().buffer();
         let text: String = (0..10).map(|y| row(buf, y)).collect();

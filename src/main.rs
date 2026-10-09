@@ -2,7 +2,9 @@ mod git;
 mod input;
 mod pty;
 mod review;
+mod session;
 mod ui;
+mod workspace;
 
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read, Write};
@@ -12,17 +14,11 @@ use std::thread;
 
 use anyhow::{Result, bail};
 use crossterm::terminal;
-use portable_pty::{CommandBuilder, PtySize};
 use ratatui::layout::Rect;
 use signal_hook::consts::SIGWINCH;
 use signal_hook::iterator::Signals;
 
-enum Event {
-    Output(Vec<u8>),
-    Exited,
-    Resize,
-    Keys(Vec<u8>),
-}
+use session::{Event, Session};
 
 // Click and drag reports (1000, 1002) in SGR encoding (1006), which has no 223-column limit.
 // Any-motion tracking (1003) is left off so idle mouse movement doesn't wake the loop.
@@ -54,66 +50,31 @@ fn main() -> ExitCode {
     }
 }
 
-fn pty_size(area: Rect) -> PtySize {
-    PtySize {
-        rows: area.height,
-        cols: area.width,
-        ..Default::default()
-    }
-}
-
 fn run() -> Result<ExitCode> {
     if !io::stdin().is_terminal() {
         bail!("stdin is not a terminal");
     }
 
+    let launch_dir = std::env::current_dir()?;
+    let sidebar_dir = review::clean(
+        &launch_dir
+            .file_name()
+            .map_or_else(|| "/".into(), |n| n.to_string_lossy()),
+    );
     let (cols, rows) = terminal::size()?;
-    let inner = ui::layout(Rect::new(0, 0, cols, rows)).pane_inner;
+    let (tx, rx) = mpsc::channel();
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
-    let mut cmd = CommandBuilder::new(shell);
-    cmd.cwd(std::env::current_dir()?);
-    // vt100 is the emulator now, so advertise what it understands rather than the outer terminal.
-    cmd.env("TERM", "xterm-256color");
-    let pty::Pane {
-        master,
-        mut child,
-        mut reader,
-        mut writer,
-    } = pty::spawn(cmd, pty_size(inner))?;
-    let mut parser = vt100::Parser::new(inner.height, inner.width, 0);
+    let mut session = Session::new(
+        shell,
+        launch_dir.clone(),
+        ui::layout(Rect::new(0, 0, cols, rows)).pane,
+        tx.clone(),
+    )?;
 
     let mut term = ratatui::try_init()?;
     let _restore = RestoreTerminal;
     io::stdout().write_all(MOUSE_ON)?;
     io::stdout().flush()?;
-    let (tx, rx) = mpsc::channel();
-
-    let output_tx = tx.clone();
-    thread::spawn(move || {
-        let mut buf = [0u8; 8192];
-        // Linux reports a hung-up PTY master as EIO rather than EOF, so any read error means exit.
-        while let Ok(n @ 1..) = reader.read(&mut buf) {
-            if output_tx.send(Event::Output(buf[..n].to_vec())).is_err() {
-                return;
-            }
-        }
-        let _ = output_tx.send(Event::Exited);
-    });
-
-    let (shell_tx, shell_rx) = mpsc::channel::<Vec<u8>>();
-    // Writes to the PTY block while the shell isn't reading, so they get their own thread
-    // rather than stalling rendering. It ends when the main loop drops shell_tx.
-    thread::spawn(move || {
-        for bytes in shell_rx {
-            if writer
-                .write_all(&bytes)
-                .and_then(|_| writer.flush())
-                .is_err()
-            {
-                return;
-            }
-        }
-    });
 
     let input_tx = tx.clone();
     // Blocks on stdin forever so it can't be joined; it ends with the process.
@@ -137,34 +98,52 @@ fn run() -> Result<ExitCode> {
         }
     });
 
-    let launch_dir = std::env::current_dir()?;
-    let mut pane_inner = inner;
     let mut view = ui::View::Shell;
     let mut input = input::Input::default();
-    term.draw(|f| ui::draw(f, parser.screen(), &view))?;
-    for event in &rx {
+    loop {
+        let sidebar = ui::Sidebar {
+            workspaces: session.workspace_count(),
+            active: session.active(),
+            dir: sidebar_dir.clone(),
+        };
+        term.draw(|f| ui::draw(f, &sidebar, &session.visible(), &view))?;
+        let Ok(event) = rx.recv() else {
+            unreachable!("the session holds a sender for the whole loop");
+        };
         match event {
-            Event::Output(bytes) => parser.process(&bytes),
+            Event::Output(id, bytes) => session.output(id, &bytes),
             Event::Resize => {
                 term.autoresize()?;
                 let size = term.size()?;
-                pane_inner = ui::layout(Rect::new(0, 0, size.width, size.height)).pane_inner;
-                parser
-                    .screen_mut()
-                    .set_size(pane_inner.height, pane_inner.width);
-                master.resize(pty_size(pane_inner))?;
+                session.resize(ui::layout(Rect::new(0, 0, size.width, size.height)).pane)?;
             }
-            Event::Exited => break,
+            Event::Exited(id) => {
+                if let Some(code) = session.exited(id)? {
+                    return Ok(ExitCode::from(code.min(255) as u8));
+                }
+            }
             Event::Keys(bytes) => {
                 let mut actions = VecDeque::from(input.feed(&bytes));
                 while let Some(action) = actions.pop_front() {
+                    // Pane and workspace commands act on the shells, so they bring them back into view.
+                    let shows_panes = matches!(
+                        action,
+                        input::Action::NewWorkspace
+                            | input::Action::Split(_)
+                            | input::Action::ClosePane
+                            | input::Action::FocusNext
+                            | input::Action::Focus(_)
+                            | input::Action::SelectWorkspace(_)
+                    );
+                    if shows_panes {
+                        view = ui::View::Shell;
+                    }
                     match action {
                         input::Action::Bytes(bytes) => match &mut view {
-                            ui::View::Shell => {
-                                let _ = shell_tx.send(bytes);
-                            }
+                            ui::View::Shell => session.send(bytes),
                             ui::View::Review(review) => {
-                                let page = ui::review_page(pane_inner);
+                                let page =
+                                    ui::review_page(ui::layout(term_area(&term)?).pane_inner);
                                 let closed = review::parse_keys(&bytes).into_iter().any(|key| {
                                     matches!(review.handle(key, page), review::Outcome::Close)
                                 });
@@ -179,11 +158,16 @@ fn run() -> Result<ExitCode> {
                             }
                         },
                         input::Action::Mouse(mouse) => {
-                            let size = term.size()?;
-                            let screen = Rect::new(0, 0, size.width, size.height);
-                            match (ui::hit(screen, &view, mouse.col, mouse.row), mouse.kind()) {
+                            let screen = term_area(&term)?;
+                            match (
+                                ui::hit(screen, &view, &sidebar, mouse.col, mouse.row),
+                                mouse.kind(),
+                            ) {
                                 (ui::Hit::MenuKey(key), input::MouseKind::LeftPress) => {
                                     actions.extend(input::command(key));
+                                }
+                                (ui::Hit::Workspace(i), input::MouseKind::LeftPress) => {
+                                    actions.push_back(input::Action::SelectWorkspace(i));
                                 }
                                 (ui::Hit::TreeRow(row), input::MouseKind::LeftPress) => {
                                     if let ui::View::Review(review) = &mut view {
@@ -204,6 +188,11 @@ fn run() -> Result<ExitCode> {
                                         review.handle(key, WHEEL_LINES);
                                     }
                                 }
+                                (ui::Hit::Nothing, input::MouseKind::LeftPress)
+                                    if matches!(view, ui::View::Shell) =>
+                                {
+                                    session.focus_at(mouse.col, mouse.row);
+                                }
                                 _ => {}
                             }
                         }
@@ -216,18 +205,32 @@ fn run() -> Result<ExitCode> {
                                 _ => ui::View::Shell,
                             };
                         }
+                        input::Action::NewWorkspace => {
+                            if let Err(e) = session.new_workspace() {
+                                view = ui::View::Unavailable(format!("Can't start a shell: {e:#}"));
+                            }
+                        }
+                        input::Action::Split(axis) => {
+                            if let Err(e) = session.split(axis) {
+                                view = ui::View::Unavailable(format!("Can't start a shell: {e:#}"));
+                            }
+                        }
+                        input::Action::ClosePane => session.close_focused(),
+                        input::Action::FocusNext => session.focus_next(),
+                        input::Action::Focus(dir) => session.focus_toward(dir),
+                        input::Action::SelectWorkspace(i) => session.select_workspace(i),
                         input::Action::Quit => {
-                            child.kill()?;
-                            child.wait()?;
+                            session.kill_all()?;
                             return Ok(ExitCode::SUCCESS);
                         }
                     }
                 }
             }
         }
-        term.draw(|f| ui::draw(f, parser.screen(), &view))?;
     }
+}
 
-    let status = child.wait()?;
-    Ok(ExitCode::from(status.exit_code().min(255) as u8))
+fn term_area(term: &ratatui::DefaultTerminal) -> Result<Rect> {
+    let size = term.size()?;
+    Ok(Rect::new(0, 0, size.width, size.height))
 }

@@ -1,12 +1,21 @@
 const PREFIX: u8 = 0x02; // Ctrl-b
 const SGR_MOUSE: &[u8] = b"\x1b[<";
 
+use crate::workspace::{Axis, Direction};
+
 #[derive(Debug, PartialEq)]
 pub enum Action {
     Bytes(Vec<u8>),
     Mouse(Mouse),
     Quit,
     ToggleReview,
+    NewWorkspace,
+    Split(Axis),
+    ClosePane,
+    FocusNext,
+    Focus(Direction),
+    /// 0-based index into the sidebar's workspace list.
+    SelectWorkspace(usize),
 }
 
 /// One SGR (1006) mouse report. Coordinates are 0-based screen cells; `code` keeps the raw
@@ -44,6 +53,12 @@ pub fn command(key: u8) -> Option<Action> {
     match key {
         b'q' => Some(Action::Quit),
         b'g' => Some(Action::ToggleReview),
+        b'n' => Some(Action::NewWorkspace),
+        b's' => Some(Action::Split(Axis::SideBySide)),
+        b'S' => Some(Action::Split(Axis::Stacked)),
+        b'x' => Some(Action::ClosePane),
+        b'o' => Some(Action::FocusNext),
+        b'1'..=b'9' => Some(Action::SelectWorkspace((key - b'1') as usize)),
         _ => None,
     }
 }
@@ -125,9 +140,18 @@ impl Input {
                 continue;
             }
             self.prefixed = false;
+            let arrow = match bytes.get(i..i + 2) {
+                Some([b'[' | b'O', b'A']) => Some(Direction::Up),
+                Some([b'[' | b'O', b'B']) => Some(Direction::Down),
+                Some([b'[' | b'O', b'C']) => Some(Direction::Right),
+                Some([b'[' | b'O', b'D']) => Some(Direction::Left),
+                _ => None,
+            };
             let command = match b {
-                // Advertised in the menu but not implemented yet; swallowed so they don't leak to the shell.
-                b'n' | b's' => continue,
+                0x1b if arrow.is_some() => {
+                    i += 2;
+                    Action::Focus(arrow.expect("checked"))
+                }
                 PREFIX => {
                     plain.push(PREFIX);
                     continue;
@@ -202,8 +226,8 @@ mod tests {
     #[test]
     fn unbound_key_after_prefix_forwards_both() {
         assert_eq!(
-            Input::default().feed(&[PREFIX, b'x', b'y']),
-            vec![Action::Bytes(vec![PREFIX, b'x', b'y'])]
+            Input::default().feed(&[PREFIX, b'z', b'y']),
+            vec![Action::Bytes(vec![PREFIX, b'z', b'y'])]
         );
     }
 
@@ -292,7 +316,37 @@ mod tests {
     }
 
     #[test]
-    fn placeholder_commands_are_swallowed() {
-        assert_eq!(Input::default().feed(&[PREFIX, b'n', PREFIX, b's']), vec![]);
+    fn pane_and_workspace_commands() {
+        assert_eq!(
+            Input::default().feed(b"\x02n\x02s\x02S\x02x\x02o\x023"),
+            vec![
+                Action::NewWorkspace,
+                Action::Split(Axis::SideBySide),
+                Action::Split(Axis::Stacked),
+                Action::ClosePane,
+                Action::FocusNext,
+                Action::SelectWorkspace(2),
+            ]
+        );
+    }
+
+    #[test]
+    fn prefix_arrows_move_focus_but_plain_arrows_reach_the_shell() {
+        assert_eq!(
+            Input::default().feed(b"\x02\x1b[D\x02\x1bOA\x1b[B"),
+            vec![
+                Action::Focus(Direction::Left),
+                Action::Focus(Direction::Up),
+                Action::Bytes(b"\x1b[B".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn prefix_then_esc_forwards_both() {
+        assert_eq!(
+            Input::default().feed(b"\x02\x1b"),
+            vec![Action::Bytes(b"\x02\x1b".to_vec())]
+        );
     }
 }

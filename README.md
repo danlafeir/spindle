@@ -2,7 +2,9 @@
 
 A keyboard-first, agent-aware terminal multiplexer: real PTY panes, a sidebar of workspaces and running agents, a quiet sound when an agent needs attention, and a built-in git changeset viewer.
 
-Status: early development. Today spindle has a working review view for git changes (below), inside a layout mock: a left sidebar with the menu on top, then workspaces and agents, and your `$SHELL` (falling back to `/bin/sh`) running in a pane on the right. The sidebar contents are static placeholders, not real workspaces or detected agents. The session ends when the shell exits.
+Status: early development. Today spindle runs your `$SHELL` (falling back to `/bin/sh`) in panes you can split, grouped into workspaces, with a review view for git changes (below). The left sidebar has the menu on top, then your workspaces, then agents; the agents list is still a static placeholder, not detected agents.
+
+Every pane and workspace starts in the directory spindle was launched from. When a pane's shell exits the pane closes and its neighbours take its space; a workspace with no panes left goes away, and spindle exits when the last shell does.
 
 ## Keys
 
@@ -10,16 +12,21 @@ The prefix is `Ctrl-b`, then:
 
 | Key | Action |
 | --- | --- |
+| `n` | New workspace |
+| `s` / `S` | Split the focused pane side by side / stacked |
+| `x` | Close the focused pane (kills its shell) |
+| `o` | Focus the next pane |
+| arrows | Focus the pane in that direction |
+| `1`–`9` | Switch to that workspace |
 | `g` | Open or close the review view |
-| `q` | Quit spindle (kills the shell) |
-| `n`, `s` | Placeholders for new workspace and split; they do nothing yet |
+| `q` | Quit spindle (kills every shell) |
 | `Ctrl-b` | Send a literal `Ctrl-b` to the shell |
 
-Any other key after the prefix is passed to the shell along with the `Ctrl-b`.
+Any other key after the prefix is passed to the shell along with the `Ctrl-b`. Splitting along the same direction again adds an equal-width sibling rather than halving the pane, as in tmux, and a pane too small to halve won't split. With more than one pane, the focused one has a cyan border.
 
 ## Mouse
 
-Click `review` or `quit` in the sidebar menu to do the same as `Ctrl-b g` or `Ctrl-b q`. In the review view, click a file to show it or a folder to fold it, and use the wheel to scroll the diff.
+Click any command in the sidebar menu to run it, a workspace in the sidebar to switch to it, or a pane to focus it. In the review view, click a file to show it or a folder to fold it, and use the wheel to scroll the diff.
 
 spindle captures the mouse, so dragging no longer selects text. In Terminal.app, hold `Fn` while dragging to select, or turn off View → Allow Mouse Reporting.
 
