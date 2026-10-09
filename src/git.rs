@@ -100,8 +100,13 @@ fn nul_paths(bytes: &[u8]) -> impl Iterator<Item = PathBuf> + '_ {
 
 fn parse_status(bytes: &[u8]) -> BTreeMap<PathBuf, Change> {
     let mut changes = BTreeMap::new();
-    let mut entries = bytes.split(|&b| b == 0).filter(|e| e.len() > 3);
+    let mut entries = bytes.split(|&b| b == 0);
     while let Some(entry) = entries.next() {
+        // Skips the empty field after the final NUL. Only entries are checked: a rename's
+        // source path is read below and can be as short as one byte.
+        if entry.len() < 4 {
+            continue;
+        }
         let (x, y) = (entry[0], entry[1]);
         let path = PathBuf::from(OsStr::from_bytes(&entry[3..]));
         let change = match (x, y) {
@@ -266,6 +271,26 @@ pub mod tests {
         assert_eq!(get("src/new.rs"), Some(Change::Untracked));
         assert_eq!(get("keep.txt"), None);
         assert_eq!(changes.len(), 6, "{changes:?}");
+    }
+
+    #[test]
+    fn short_rename_source_does_not_swallow_the_next_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q"]);
+        write(dir, "a.c", "same contents for rename detection\n");
+        write(dir, "mod.txt", "x\n");
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-q", "-m", "init"]);
+        git(dir, &["mv", "a.c", "b.c"]);
+        write(dir, "mod.txt", "changed\n");
+
+        let changes = Repo::discover(dir).unwrap().changes().unwrap();
+        assert_eq!(
+            changes.get(Path::new("b.c")),
+            Some(&Change::Renamed { from: "a.c".into() })
+        );
+        assert_eq!(changes.get(Path::new("mod.txt")), Some(&Change::Modified));
     }
 
     #[test]
