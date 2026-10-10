@@ -58,9 +58,10 @@ pub struct Session {
     cwd: PathBuf,
     events: Sender<Event>,
     area: Rect,
-    /// The pane a mouse button went down in. Drags and the release follow it there even if the
-    /// pointer leaves, so the app never sees a button that is stuck down.
-    mouse_grab: Option<PaneId>,
+    /// The pane a mouse button went down in, with the last report sent there. Drags and the
+    /// release follow it there even if the pointer leaves, so the app never sees a button that
+    /// is stuck down.
+    mouse_grab: Option<(PaneId, Mouse)>,
 }
 
 impl Session {
@@ -138,6 +139,7 @@ impl Session {
     }
 
     pub fn new_workspace(&mut self) -> Result<()> {
+        self.release_mouse();
         let id = self.spawn(ui::pane_inner(self.area))?;
         self.workspaces.push(Workspace::new(id));
         self.active = self.workspaces.len() - 1;
@@ -238,13 +240,59 @@ impl Session {
 
     pub fn select_workspace(&mut self, index: usize) {
         if index < self.workspaces.len() {
+            self.release_mouse();
             self.active = index;
-            self.mouse_grab = None;
         }
     }
 
     pub fn grabbing_mouse(&self) -> bool {
         self.mouse_grab.is_some()
+    }
+
+    /// Ends a drag when spindle takes the mouse away from the panes, by sending the app the
+    /// release it would otherwise never get.
+    pub fn release_mouse(&mut self) {
+        let Some((id, last)) = self.mouse_grab.take() else {
+            return;
+        };
+        let rect = self
+            .workspaces
+            .iter()
+            .flat_map(|ws| ws.rects(self.area))
+            .find_map(|(pane, rect)| (pane == id).then_some(rect));
+        if let Some(rect) = rect {
+            let release = Mouse {
+                code: last.code & !32,
+                release: true,
+                ..last
+            };
+            self.send_mouse(id, ui::pane_inner(rect), release);
+        }
+    }
+
+    /// Sends `mouse` to the app in pane `id`, relative to its screen and clamped to it. False
+    /// when the app didn't ask for this kind of report.
+    fn send_mouse(&self, id: PaneId, inner: Rect, mouse: Mouse) -> bool {
+        let Some(pane) = self.panes.get(&id) else {
+            return false;
+        };
+        let col = mouse
+            .col
+            .saturating_sub(inner.x)
+            .min(inner.width.saturating_sub(1));
+        let row = mouse
+            .row
+            .saturating_sub(inner.y)
+            .min(inner.height.saturating_sub(1));
+        let screen = pane.parser.screen();
+        let mode = screen.mouse_protocol_mode();
+        match mouse.encode_for(col, row, mode, screen.mouse_protocol_encoding()) {
+            Some(bytes) => {
+                let _ = pane.input.send(bytes);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Handles a mouse report over the panes: a press focuses its pane, and the report goes on
@@ -257,7 +305,7 @@ impl Session {
             .iter()
             .find(|(_, r)| r.contains(pos))
             .map(|(id, _)| *id);
-        let target = self.mouse_grab.or(under);
+        let target = self.mouse_grab.map(|(id, _)| id).or(under);
         let Some((id, rect)) = rects.into_iter().find(|(id, _)| Some(*id) == target) else {
             self.mouse_grab = None;
             return false;
@@ -272,26 +320,21 @@ impl Session {
             return true;
         }
         if press {
-            self.mouse_grab = Some(id);
+            self.mouse_grab = Some((id, mouse));
         } else if mouse.release && !mouse.is_wheel() {
             self.mouse_grab = None;
+        } else if let Some((_, last)) = &mut self.mouse_grab
+            && mouse.is_motion()
+        {
+            *last = mouse;
         }
 
-        let col = mouse
-            .col
-            .saturating_sub(inner.x)
-            .min(inner.width.saturating_sub(1));
-        let row = mouse
-            .row
-            .saturating_sub(inner.y)
-            .min(inner.height.saturating_sub(1));
+        if self.send_mouse(id, inner, mouse) {
+            return true;
+        }
         let pane = &self.panes[&id];
         let screen = pane.parser.screen();
         let mode = screen.mouse_protocol_mode();
-        if let Some(bytes) = mouse.encode_for(col, row, mode, screen.mouse_protocol_encoding()) {
-            let _ = pane.input.send(bytes);
-            return true;
-        }
         // Like most terminals, scroll full-screen apps that don't take the mouse (less, man)
         // with arrow keys. At a shell prompt that would walk history, so it's left alone there.
         if mode == vt100::MouseProtocolMode::None && screen.alternate_screen() {
@@ -510,6 +553,47 @@ mod tests {
             "19 columns can't halve again"
         );
         assert_eq!(session.visible().len(), 2);
+        session.kill_all().unwrap();
+    }
+
+    #[test]
+    fn a_drag_spindle_takes_the_mouse_from_is_released() {
+        let (tx, _rx) = mpsc::channel();
+        let area = Rect::new(26, 0, 80, 24);
+        let mut session = Session::new("/bin/sh".into(), std::env::temp_dir(), area, tx).unwrap();
+        let id = session.focused();
+        let (typed_tx, typed) = mpsc::channel();
+        session.panes.get_mut(&id).unwrap().input = typed_tx;
+        let sent = || typed.try_iter().flatten().collect::<Vec<u8>>();
+        session.output(id, b"\x1b[?1002h\x1b[?1006h");
+
+        let press = Mouse {
+            code: 0,
+            col: 36,
+            row: 5,
+            release: false,
+        };
+        session.mouse(press);
+        session.mouse(Mouse {
+            code: 32,
+            col: 40,
+            ..press
+        });
+        assert_eq!(sent(), b"\x1b[<0;10;5M\x1b[<32;14;5M");
+
+        session.release_mouse();
+        assert_eq!(sent(), b"\x1b[<0;14;5m", "released where the drag got to");
+        assert!(!session.grabbing_mouse());
+        session.release_mouse();
+        assert_eq!(sent(), b"", "nothing held, nothing sent");
+
+        session.mouse(press);
+        session.new_workspace().unwrap();
+        assert_eq!(
+            sent(),
+            b"\x1b[<0;10;5M\x1b[<0;10;5m",
+            "switching away releases it in the hidden pane"
+        );
         session.kill_all().unwrap();
     }
 }

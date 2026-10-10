@@ -294,6 +294,11 @@ fn run() -> Result<ExitCode> {
                     }
                 }
             }
+            // The panes stop getting the mouse while help or the review is up, so a drag there
+            // can't end on its own.
+            if help == ui::Help::Shown || !matches!(view, ui::View::Shell) {
+                session.release_mouse();
+            }
             if batch_started.elapsed() >= FRAME_BUDGET {
                 break;
             }
