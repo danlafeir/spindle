@@ -75,16 +75,18 @@ fn drain(mut pipe: impl Read + Send + 'static, limit: u64) -> thread::JoinHandle
 }
 
 fn run(dir: &Path, args: &[&str]) -> Result<Output> {
-    run_capped(dir, args, u64::MAX)
+    run_capped(dir, args, &[], u64::MAX)
 }
 
-fn run_capped(dir: &Path, args: &[&str], stdout_limit: u64) -> Result<Output> {
+/// `paths` go after `args` as they are, since a file name needn't be valid UTF-8.
+fn run_capped(dir: &Path, args: &[&str], paths: &[&Path], stdout_limit: u64) -> Result<Output> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(dir)
         // An fsmonitor hook in a repo's own .git/config would otherwise run on every `git status`.
         .args(["-c", "core.fsmonitor=false"])
         .args(args)
+        .args(paths)
         // Read-only views must not take index.lock and collide with git running in the shell.
         .env("GIT_OPTIONAL_LOCKS", "0")
         // Paths come from git's own listings, so `[`, `*` or `?` in a name is literal, never a glob.
@@ -200,7 +202,6 @@ impl Repo {
     }
 
     pub fn diff(&self, path: &Path, change: &Change) -> Result<String> {
-        let path = path.to_string_lossy();
         let base = [
             "--no-pager",
             "diff",
@@ -208,22 +209,18 @@ impl Repo {
             "--no-ext-diff",
             "--no-textconv",
         ];
-        let out = match change {
-            Change::Untracked => {
-                let args = [&base[..], &["--no-index", "--", "/dev/null", &path]].concat();
-                run_capped(&self.root, &args, MAX_DIFF_BYTES)?
-            }
-            Change::Renamed { from } => {
-                let from = from.to_string_lossy();
-                let args = [&base[..], &["-M", "HEAD", "--", &from, &path]].concat();
-                run_capped(&self.root, &args, MAX_DIFF_BYTES)?
-            }
-            _ => run_capped(
-                &self.root,
-                &[&base[..], &["HEAD", "--", &path]].concat(),
-                MAX_DIFF_BYTES,
-            )?,
+        let (args, paths) = match change {
+            Change::Untracked => (
+                [&base[..], &["--no-index", "--"]].concat(),
+                vec![Path::new("/dev/null"), path],
+            ),
+            Change::Renamed { from } => (
+                [&base[..], &["-M", "HEAD", "--"]].concat(),
+                vec![from.as_path(), path],
+            ),
+            _ => ([&base[..], &["HEAD", "--"]].concat(), vec![path]),
         };
+        let out = run_capped(&self.root, &args, &paths, MAX_DIFF_BYTES)?;
         // --no-index exits 1 to mean "files differ", which is the expected outcome for untracked files.
         if !matches!(out.code, Some(0 | 1)) {
             return Err(out.error("git diff"));
@@ -448,5 +445,40 @@ pub mod tests {
             .unwrap();
         assert!(!marker("fsmonitor").exists(), "fsmonitor hook ran");
         assert!(!marker("textconv").exists(), "textconv filter ran");
+    }
+
+    #[test]
+    fn diffs_files_whose_names_are_not_utf8() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        git(dir, &["init", "-q"]);
+        write(dir, "blob", "x\n");
+        let sha = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["hash-object", "-w", "blob"])
+            .output()
+            .unwrap()
+            .stdout;
+        let sha = String::from_utf8(sha).unwrap();
+        // macOS refuses such names on disk, so the file exists only in the commit: a deletion.
+        let name = OsStr::from_bytes(b"caf\xe9.txt");
+        let mut cacheinfo = format!("100644,{},", sha.trim()).into_bytes();
+        cacheinfo.extend(name.as_bytes());
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["update-index", "--add", "--cacheinfo"])
+            .arg(OsStr::from_bytes(&cacheinfo))
+            .status()
+            .unwrap();
+        assert!(status.success());
+        git(dir, &["commit", "-q", "-m", "init"]);
+
+        let repo = Repo::discover(dir).unwrap();
+        let changes = repo.status().unwrap().changes;
+        assert_eq!(changes.get(Path::new(name)), Some(&Change::Deleted));
+        let diff = repo.diff(Path::new(name), &Change::Deleted).unwrap();
+        assert!(diff.contains("-x"), "{diff:?}");
     }
 }
