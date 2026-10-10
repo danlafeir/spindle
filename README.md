@@ -35,7 +35,7 @@ spindle captures the mouse, so dragging no longer selects text. In Terminal.app,
 
 ## Reviewing changes
 
-`Ctrl-b g` swaps the shell pane for a review of uncommitted changes: everything that differs from `HEAD`, staged and unstaged together. On the left is a tree of the whole repo (gitignored paths hidden) with changed files marked `M` modified, `A` added, `D` deleted, `R` renamed or `?` untracked. Folders containing changes start expanded. On the right is the selected file's diff, or its contents if it hasn't changed. Symlinks show where they point rather than being followed, so a repo can't make spindle read a file outside it or block on a device. The shell keeps running underneath.
+The prefix (default `Ctrl-b`) then `g` swaps the shell pane for a review of uncommitted changes: everything that differs from `HEAD`, staged and unstaged together. On the left is a tree of the whole repo (gitignored paths hidden) with changed files marked `M` modified, `A` added, `D` deleted, `R` renamed or `?` untracked. Folders containing changes start expanded. On the right is the selected file's diff, or its contents if it hasn't changed. Symlinks show where they point rather than being followed, so a repo can't make spindle read a file outside it or block on a device. The shell keeps running underneath.
 
 | Key | Action |
 | --- | --- |
