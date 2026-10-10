@@ -82,6 +82,8 @@ fn run_capped(dir: &Path, args: &[&str], stdout_limit: u64) -> Result<Output> {
     let mut child = Command::new("git")
         .arg("-C")
         .arg(dir)
+        // An fsmonitor hook in a repo's own .git/config would otherwise run on every `git status`.
+        .args(["-c", "core.fsmonitor=false"])
         .args(args)
         // Read-only views must not take index.lock and collide with git running in the shell.
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -199,7 +201,13 @@ impl Repo {
 
     pub fn diff(&self, path: &Path, change: &Change) -> Result<String> {
         let path = path.to_string_lossy();
-        let base = ["--no-pager", "diff", "--no-color", "--no-ext-diff"];
+        let base = [
+            "--no-pager",
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+        ];
         let out = match change {
             Change::Untracked => {
                 let args = [&base[..], &["--no-index", "--", "/dev/null", &path]].concat();
@@ -415,5 +423,30 @@ pub mod tests {
     fn discover_outside_a_repo_is_an_error() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(Repo::discover(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn a_repos_own_config_cannot_run_commands() {
+        let tmp = fixture();
+        let dir = tmp.path();
+        let marker = |name: &str| dir.join(".git").join(name);
+        let touch = |name: &str| format!("touch '{}'", marker(name).display());
+        git(dir, &["config", "core.fsmonitor", &touch("fsmonitor")]);
+        git(
+            dir,
+            &[
+                "config",
+                "diff.evil.textconv",
+                &format!("{}; cat", touch("textconv")),
+            ],
+        );
+        write(dir, ".gitattributes", "*.txt diff=evil\n");
+
+        let repo = Repo::discover(dir).unwrap();
+        let changes = repo.status().unwrap().changes;
+        repo.diff(Path::new("mod.txt"), &changes[Path::new("mod.txt")])
+            .unwrap();
+        assert!(!marker("fsmonitor").exists(), "fsmonitor hook ran");
+        assert!(!marker("textconv").exists(), "textconv filter ran");
     }
 }
