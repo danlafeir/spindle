@@ -47,7 +47,9 @@ The prefix (default `Ctrl-b`) then `g` swaps the shell pane for a review of unco
 | `r` | Reload from git |
 | `q` or `Esc` | Back to the shell |
 
-The review shows the repo spindle was launched in, not wherever the shell has since `cd`'d to. The tree and each file's diff load in the background, so a large repo shows *Loading…* for a moment rather than freezing your shells.
+The review shows the repo spindle was launched in, not wherever the shell has since `cd`'d to. The tree and each file's diff load in the background, so a large repo shows *Loading…* for a moment rather than freezing your shells. Launched outside a git repo, the review opens and says so where the diff would be.
+
+Opening the review doesn't run a `core.fsmonitor` hook or diff `textconv` driver set in the repo's `.git/config`. Clean filters, such as git-lfs's, still run, since without them every filtered file would show as modified.
 
 ## Configuration
 
