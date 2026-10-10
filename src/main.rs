@@ -1,3 +1,4 @@
+mod config;
 mod git;
 mod input;
 mod pty;
@@ -55,6 +56,11 @@ fn run() -> Result<ExitCode> {
     if !io::stdin().is_terminal() {
         bail!("stdin is not a terminal");
     }
+    // Before any shell starts, so a bad config exits cleanly.
+    let config = match config::path() {
+        Some(path) => config::load(&path)?,
+        None => config::Config::default(),
+    };
 
     let launch_dir = std::env::current_dir()?;
     let sidebar_dir = review::clean(
@@ -101,12 +107,13 @@ fn run() -> Result<ExitCode> {
     });
 
     let mut view = ui::View::Shell;
-    let mut input = input::Input::default();
+    let mut input = input::Input::new(config.prefix);
     let mut flush_at: Option<Instant> = None;
     let sidebar = |session: &Session| ui::Sidebar {
         workspaces: session.workspace_count(),
         active: session.active(),
         dir: sidebar_dir.clone(),
+        prefix: config.prefix,
     };
     let mut dirty = true;
     loop {

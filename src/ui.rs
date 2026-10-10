@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use tui_term::widget::PseudoTerminal;
 
+use crate::config::Prefix;
 use crate::git::Change;
 use crate::review::{Content, Review, Row, RowKind};
 
@@ -51,6 +52,7 @@ pub struct Sidebar {
     pub active: usize,
     /// Every workspace starts in the launch directory, so they share its name.
     pub dir: String,
+    pub prefix: Prefix,
 }
 
 struct SidebarAreas {
@@ -128,7 +130,7 @@ pub fn hit(screen: Rect, view: &View, sidebar: &Sidebar, col: u16, row: u16) -> 
         return Hit::Workspace((row - lists.y - 1) as usize);
     }
     if menu.contains(pos) {
-        let line = &menu_lines()[(row - menu.y) as usize];
+        let line = &menu_lines(sidebar.prefix)[(row - menu.y) as usize];
         let mut x = menu.x;
         // A key and the label after it both count as the button.
         let mut key = None;
@@ -162,7 +164,7 @@ pub fn draw(frame: &mut Frame, sidebar: &Sidebar, panes: &[PaneView], view: &Vie
 
     frame.render_widget(Block::bordered().title(" spindle "), areas.sidebar);
     let SidebarAreas { menu, rule, lists } = sidebar_areas(areas.sidebar);
-    frame.render_widget(Paragraph::new(menu_lines()), menu);
+    frame.render_widget(Paragraph::new(menu_lines(sidebar.prefix)), menu);
     frame.render_widget(Block::new().borders(Borders::TOP).dark_gray(), rule);
     frame.render_widget(Paragraph::new(sidebar_lists(sidebar)), lists);
 
@@ -194,13 +196,13 @@ pub fn draw(frame: &mut Frame, sidebar: &Sidebar, panes: &[PaneView], view: &Vie
     }
 }
 
-fn menu_lines() -> Vec<Line<'static>> {
+fn menu_lines(prefix: Prefix) -> Vec<Line<'static>> {
     let key = |k: &'static str| {
         Span::styled(k, Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD))
     };
     vec![
         Line::from(vec![
-            Span::raw("^b ").dark_gray(),
+            Span::raw(format!("{} ", prefix.caret())).dark_gray(),
             key("n"),
             Span::raw(" new  "),
             key("x"),
@@ -388,6 +390,7 @@ mod tests {
             workspaces,
             active: 0,
             dir: "spindle".into(),
+            prefix: Prefix::default(),
         }
     }
 
@@ -530,6 +533,19 @@ mod tests {
         assert_eq!(key_at((x + 5, y)), Some('q'), "label");
         assert_eq!(key_at(find(&rows, "^b")), None);
         assert_eq!(key_at(find(&rows, "WORKSPACES")), None);
+    }
+
+    #[test]
+    fn menu_shows_the_configured_prefix() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let sidebar = Sidebar {
+            prefix: crate::config::tests::prefix("C-a"),
+            ..sidebar(1)
+        };
+        terminal
+            .draw(|f| draw(f, &sidebar, &[], &View::Shell))
+            .unwrap();
+        assert!(row(terminal.backend().buffer(), 1).contains("^a n new"));
     }
 
     #[test]

@@ -1,4 +1,3 @@
-const PREFIX: u8 = 0x02; // Ctrl-b
 const SGR_MOUSE: &[u8] = b"\x1b[<";
 // Real reports are at most about 20 bytes; anything longer without a final byte is garbage.
 const MAX_MOUSE_REPORT: usize = 32;
@@ -9,6 +8,7 @@ pub const ESC_WAIT: std::time::Duration = std::time::Duration::from_millis(25);
 
 use vt100::{MouseProtocolEncoding, MouseProtocolMode};
 
+use crate::config::Prefix;
 use crate::workspace::{Axis, Direction};
 
 #[derive(Debug, PartialEq)]
@@ -147,16 +147,30 @@ fn parse_mouse(bytes: &[u8]) -> Option<(usize, Option<Mouse>)> {
 }
 
 /// Splits keyboard bytes into plain input and spindle's own commands, in the order they were
-/// typed. The prefix state lives across calls because Ctrl-b and the key after it can arrive in
-/// separate reads.
-#[derive(Default)]
+/// typed. The prefix state lives across calls because the prefix and the key after it can arrive
+/// in separate reads.
 pub struct Input {
+    prefix: u8,
     prefixed: bool,
     /// The start of a possible mouse report whose remainder hasn't been read yet.
     partial: Vec<u8>,
 }
 
+impl Default for Input {
+    fn default() -> Self {
+        Input::new(Prefix::default())
+    }
+}
+
 impl Input {
+    pub fn new(prefix: Prefix) -> Self {
+        Input {
+            prefix: prefix.byte(),
+            prefixed: false,
+            partial: Vec::new(),
+        }
+    }
+
     /// Mouse reports never reach the shell as bytes: the outer terminal only sends them because
     /// spindle asked, so a shell would see them as garbage typing. They also leave the prefix
     /// state alone, so moving the mouse between Ctrl-b and its key doesn't cancel the command.
@@ -216,7 +230,7 @@ impl Input {
             }
             i += 1;
             if !self.prefixed {
-                if b == PREFIX {
+                if b == self.prefix {
                     self.prefixed = true;
                 } else {
                     plain.push(b);
@@ -236,14 +250,14 @@ impl Input {
                     i += 2;
                     Action::Focus(arrow.expect("checked"))
                 }
-                PREFIX => {
-                    plain.push(PREFIX);
+                b if b == self.prefix => {
+                    plain.push(self.prefix);
                     continue;
                 }
                 other => match command(other) {
                     Some(command) => command,
                     None => {
-                        plain.extend([PREFIX, other]);
+                        plain.extend([self.prefix, other]);
                         continue;
                     }
                 },
@@ -263,6 +277,8 @@ impl Input {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const PREFIX: u8 = 0x02;
 
     #[test]
     fn plain_bytes_pass_through() {
@@ -517,6 +533,17 @@ mod tests {
                 Action::Focus(Direction::Up),
                 Action::Bytes(b"\x1b[B".to_vec()),
             ]
+        );
+    }
+
+    #[test]
+    fn configured_prefix_replaces_ctrl_b() {
+        let prefix = crate::config::tests::prefix("C-a");
+        assert_eq!(Input::new(prefix).feed(b"\x01q"), vec![Action::Quit]);
+        assert_eq!(
+            Input::new(prefix).feed(b"\x01\x01\x01z\x02q"),
+            vec![Action::Bytes(b"\x01\x01z\x02q".to_vec())],
+            "double prefix is one literal, unbound keys pass with it, Ctrl-b is plain"
         );
     }
 }

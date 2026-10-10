@@ -8,7 +8,7 @@ Every pane and workspace starts in the directory spindle was launched from. When
 
 ## Keys
 
-The prefix is `Ctrl-b`, then:
+The prefix is `Ctrl-b` by default (see [Configuration](#configuration)), then:
 
 | Key | Action |
 | --- | --- |
@@ -20,9 +20,9 @@ The prefix is `Ctrl-b`, then:
 | `1`–`9` | Switch to that workspace |
 | `g` | Open or close the review view |
 | `q` | Quit spindle (kills every shell) |
-| `Ctrl-b` | Send a literal `Ctrl-b` to the shell |
+| the prefix again | Send it to the shell as a literal key |
 
-Any other key after the prefix is passed to the shell along with the `Ctrl-b`. Splitting along the same direction again adds an equal-width sibling rather than halving the pane, as in tmux, and a pane too small to halve won't split. With more than one pane, the focused one has a cyan border.
+Any other key after the prefix is passed to the shell along with the prefix. Splitting along the same direction again adds an equal-width sibling rather than halving the pane, as in tmux, and a pane too small to halve won't split. With more than one pane, the focused one has a cyan border.
 
 ## Mouse
 
@@ -47,6 +47,17 @@ spindle captures the mouse, so dragging no longer selects text. In Terminal.app,
 | `q` or `Esc` | Back to the shell |
 
 The review shows the repo spindle was launched in, not wherever the shell has since `cd`'d to. The tree and each file's diff load in the background, so a large repo shows *Loading…* for a moment rather than freezing your shells.
+
+## Configuration
+
+spindle reads `$XDG_CONFIG_HOME/spindle/config.toml`, or `~/.config/spindle/config.toml` when that variable isn't set (macOS included). The file is optional; without it every setting has its default.
+
+```toml
+# The key that starts every command. Default "C-b".
+prefix = "C-a"
+```
+
+`prefix` takes `C-a` through `C-z`, except `C-h`, `C-i`, `C-j` and `C-m`: terminals send those as Backspace, Tab and Enter, which would then need pressing twice to reach the shell. An unreadable file, an unknown setting or a bad value stops spindle at startup with an error naming the file, rather than quietly falling back to the default.
 
 ## Try it
 
