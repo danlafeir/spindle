@@ -133,6 +133,7 @@ pub enum Outcome {
 
 /// Everything the tree is built from, loaded off the event loop.
 struct Tree {
+    repo_root: PathBuf,
     root: Node,
     changes: BTreeMap<PathBuf, Change>,
     changed_dirs: HashSet<PathBuf>,
@@ -157,6 +158,7 @@ fn load_tree(repo: &Repo) -> Result<Tree> {
         .map(Path::to_path_buf)
         .collect();
     Ok(Tree {
+        repo_root: repo.root().to_path_buf(),
         root,
         changes,
         changed_dirs,
@@ -198,7 +200,10 @@ enum UpdateKind {
 
 /// Runs git and file reads for one review. Only the newest job of each kind in the queue is
 /// done, so holding `j` diffs the row the cursor stops on, not every row it passes.
-fn work(repo: Repo, review: u64, jobs: Receiver<Job>, notify: impl Fn(Update)) {
+fn work(dir: PathBuf, review: u64, jobs: Receiver<Job>, notify: impl Fn(Update)) {
+    // Looked for again on each reload until found, so `git init` and a passing git failure
+    // both recover with `r`.
+    let mut repo: Option<Repo> = None;
     while let Ok(first) = jobs.recv() {
         let (mut tree, mut content) = (None, None);
         for job in std::iter::once(first).chain(jobs.try_iter()) {
@@ -208,11 +213,16 @@ fn work(repo: Repo, review: u64, jobs: Receiver<Job>, notify: impl Fn(Update)) {
             }
         }
         if let Some(seq) = tree {
-            let kind = UpdateKind::Tree(load_tree(&repo).map_err(|e| format!("{e:#}")));
+            let loaded = match repo.as_ref() {
+                Some(repo) => load_tree(repo),
+                None => Repo::discover(&dir).and_then(|found| load_tree(repo.insert(found))),
+            };
+            let kind = UpdateKind::Tree(loaded.map_err(|e| format!("{e:#}")));
             notify(Update { review, seq, kind });
         }
-        if let Some(Job::Content { seq, path, change }) = content {
-            let kind = UpdateKind::Content(load_content(&repo, &path, change.as_ref()));
+        // Content is only asked for once a tree has loaded, so the repo is known by then.
+        if let (Some(Job::Content { seq, path, change }), Some(repo)) = (content, &repo) {
+            let kind = UpdateKind::Content(load_content(repo, &path, change.as_ref()));
             notify(Update { review, seq, kind });
         }
     }
@@ -240,19 +250,20 @@ pub struct Review {
 }
 
 impl Review {
-    /// Opens the repo containing `dir`. The tree loads in the background, arriving through
-    /// `notify` for [`Review::apply`]; it opens with every folder that holds a change expanded
-    /// and the cursor on the first changed file.
-    pub fn open(dir: &Path, notify: impl Fn(Update) + Send + 'static) -> Result<Review> {
-        let repo = Repo::discover(dir)?;
+    /// Opens the repo containing `dir`. Finding the repo and loading its tree both happen in
+    /// the background, arriving through `notify` for [`Review::apply`]; it opens with every
+    /// folder that holds a change expanded and the cursor on the first changed file. If `dir`
+    /// isn't in a repo, that arrives as a message in place of the content.
+    pub fn open(dir: &Path, notify: impl Fn(Update) + Send + 'static) -> Review {
         let id = NEXT_REVIEW.fetch_add(1, Ordering::Relaxed);
-        let root = repo.root().to_path_buf();
         let (jobs, jobs_rx) = mpsc::channel();
+        let worker_dir = dir.to_path_buf();
         // Ends once the review is dropped and its job queue closes.
-        thread::spawn(move || work(repo, id, jobs_rx, notify));
+        thread::spawn(move || work(worker_dir, id, jobs_rx, notify));
         let mut review = Review {
             id,
-            root,
+            // Stands in for the repo root, which isn't known until the tree loads.
+            root: dir.to_path_buf(),
             jobs,
             next_seq: 0,
             tree_pending: None,
@@ -268,7 +279,7 @@ impl Review {
             scroll: 0,
         };
         review.request_tree();
-        Ok(review)
+        review
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -310,6 +321,7 @@ impl Review {
                     }
                 };
                 let selected = self.selected().map(|r| r.path.clone());
+                self.root = tree.repo_root;
                 self.tree = tree.root;
                 self.changes = tree.changes;
                 self.changed_dirs = tree.changed_dirs;
@@ -587,8 +599,7 @@ pub mod tests {
         let (tx, rx) = mpsc::channel();
         let mut review = Review::open(dir, move |u| {
             let _ = tx.send(u);
-        })
-        .unwrap();
+        });
         settle(&mut review, &rx);
         (review, rx)
     }
@@ -701,8 +712,7 @@ pub mod tests {
         let (tx, _rx) = mpsc::channel();
         let review = Review::open(tmp.path(), move |u| {
             let _ = tx.send(u);
-        })
-        .unwrap();
+        });
         assert!(review.rows().is_empty());
         assert!(matches!(review.content(), Content::Message(m) if m == LOADING));
     }
@@ -819,5 +829,41 @@ pub mod tests {
     fn clean_expands_tabs_and_neutralises_escapes() {
         assert_eq!(clean("a\tb"), "a   b");
         assert_eq!(clean("\x1b[31mred\r"), "\u{fffd}[31mred");
+    }
+
+    #[test]
+    fn outside_a_repo_says_so_in_place_of_the_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (review, _rx) = open(tmp.path());
+        assert!(review.rows().is_empty());
+        assert!(
+            matches!(review.content(), Content::Message(m) if m.contains("not inside a git repository")),
+            "{:?}",
+            match review.content() {
+                Content::Message(m) => m.as_str(),
+                _ => "not a message",
+            }
+        );
+    }
+
+    #[test]
+    fn opened_from_a_subfolder_the_title_names_the_repo_once_loaded() {
+        let tmp = fixture();
+        let (review, _rx) = open(&tmp.path().join("src"));
+        assert_eq!(
+            review.root_name(),
+            tmp.path().file_name().unwrap().to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn reload_finds_a_repo_made_after_opening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (mut review, rx) = open(tmp.path());
+        crate::git::tests::git(tmp.path(), &["init", "-q"]);
+        write(tmp.path(), "a.txt", "a\n");
+        review.handle(Key::Refresh, 1);
+        settle(&mut review, &rx);
+        assert_eq!(review.rows().len(), 1, "{:?}", review.rows());
     }
 }

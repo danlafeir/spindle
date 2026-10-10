@@ -261,16 +261,15 @@ fn run() -> Result<ExitCode> {
                     }
                     input::Action::ToggleReview => {
                         view = match view {
-                            ui::View::Shell => match review::Review::open(&launch_dir, {
-                                let tx = review_tx.clone();
-                                // Fails only once the loop has ended and nothing is left to show it.
-                                move |update| {
-                                    let _ = tx.send(Event::Review(update));
-                                }
-                            }) {
-                                Ok(review) => ui::View::Review(Box::new(review)),
-                                Err(e) => ui::View::Unavailable(format!("{e:#}")),
-                            },
+                            ui::View::Shell => {
+                                ui::View::Review(Box::new(review::Review::open(&launch_dir, {
+                                    let tx = review_tx.clone();
+                                    // Fails only once the loop has ended and nothing is left to show it.
+                                    move |update| {
+                                        let _ = tx.send(Event::Review(update));
+                                    }
+                                })))
+                            }
                             _ => ui::View::Shell,
                         };
                     }
