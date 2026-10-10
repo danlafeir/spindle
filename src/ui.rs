@@ -2,21 +2,84 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use tui_term::widget::PseudoTerminal;
 
 use crate::config::Prefix;
 use crate::git::Change;
+use crate::input::Action;
 use crate::review::{Content, Review, Row, RowKind};
 
 const SIDEBAR_WIDTH: u16 = 26;
-const MENU_HEIGHT: u16 = 3;
+const MENU_HEIGHT: u16 = 4;
 
 pub enum View {
     Shell,
     Review(Box<Review>),
     Unavailable(String),
 }
+
+/// Whether the help overlay is up. `Closing` is already off screen but still swallows mouse
+/// reports until the release of the click that closed it, so that release can't reach a pane.
+#[derive(PartialEq)]
+pub enum Help {
+    Hidden,
+    Shown,
+    Closing,
+}
+
+impl Help {
+    /// While help is up any key or click closes it and is dropped rather than reaching what's
+    /// beneath; a command closes it and still runs. True when `action` should be dropped.
+    pub fn swallows(&mut self, action: &Action) -> bool {
+        match (&*self, action) {
+            (Help::Hidden, _) => false,
+            (Help::Closing, Action::Mouse(mouse)) => {
+                if mouse.release {
+                    *self = Help::Hidden;
+                }
+                true
+            }
+            (Help::Shown, Action::Mouse(mouse)) => {
+                if !mouse.release && !mouse.is_motion() && !mouse.is_wheel() {
+                    *self = Help::Closing;
+                }
+                true
+            }
+            (Help::Shown, Action::Bytes(_) | Action::Help) => {
+                *self = Help::Hidden;
+                true
+            }
+            (Help::Shown | Help::Closing, _) => {
+                *self = Help::Hidden;
+                false
+            }
+        }
+    }
+}
+
+/// Every command after the prefix. Keys split on " / " are each a command of their own.
+const PREFIX_HELP: &[(&str, &str)] = &[
+    ("n", "new workspace"),
+    ("s / S", "split side by side / stacked"),
+    ("x", "close the focused pane"),
+    ("o", "focus the next pane"),
+    ("arrows", "focus the pane that way"),
+    ("1-9", "switch to that workspace"),
+    ("g", "open or close the review"),
+    ("h", "show this help"),
+    ("q", "quit spindle"),
+];
+
+const REVIEW_HELP: &[(&str, &str)] = &[
+    ("j/k  arrows", "move through the tree"),
+    ("h/l", "collapse / expand a folder"),
+    ("Enter  o", "toggle a folder"),
+    ("g/G", "first / last entry"),
+    ("J/K  Space", "scroll the diff"),
+    ("r", "reload from git"),
+    ("q  Esc", "back to the shell"),
+];
 
 pub struct Areas {
     pub sidebar: Rect,
@@ -222,7 +285,56 @@ fn menu_lines(prefix: Prefix) -> Vec<Line<'static>> {
             key("q"),
             Span::raw(" quit"),
         ]),
+        Line::from(vec![Span::raw("   "), key("h"), Span::raw(" help")]),
     ]
+}
+
+fn help_lines(prefix: Prefix) -> Vec<Line<'static>> {
+    let section = |title: String| Line::from(title).bold();
+    let entry = |keys: String, what: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!("  {keys:<13}"),
+                Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(what.to_owned()),
+        ])
+    };
+    let mut lines = vec![section(format!("{}, then:", prefix.name()))];
+    lines.extend(
+        PREFIX_HELP
+            .iter()
+            .map(|(k, what)| entry(k.to_string(), what)),
+    );
+    lines.push(entry(prefix.name(), "send it to the shell"));
+    lines.push(Line::from(""));
+    lines.push(section("In the review:".into()));
+    lines.extend(
+        REVIEW_HELP
+            .iter()
+            .map(|(k, what)| entry(k.to_string(), what)),
+    );
+    lines
+}
+
+/// Drawn over everything else, after [`draw`], so it covers whichever view is showing.
+pub fn draw_help(frame: &mut Frame, prefix: Prefix) {
+    let lines = help_lines(prefix);
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4;
+    let height = lines.len() as u16 + 2;
+    let area = frame
+        .area()
+        .centered(Constraint::Max(width), Constraint::Max(height));
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::bordered()
+                .title(" help ")
+                .title_bottom(Line::from(" any key closes ").dark_gray())
+                .padding(ratatui::widgets::Padding::horizontal(1)),
+        ),
+        area,
+    );
 }
 
 fn draw_review(frame: &mut Frame, area: Rect, review: &Review) {
@@ -450,9 +562,10 @@ mod tests {
         );
         assert!(sidebar_row(2).contains("s split  S stack"));
         assert!(sidebar_row(3).contains("g review q quit"));
-        assert!(sidebar_row(5).contains("WORKSPACES"));
-        assert!(sidebar_row(6).contains("▸ 1 spindle"));
-        assert!(rows.iter().position(|r| r.contains("AGENTS")).unwrap() > 6);
+        assert!(sidebar_row(4).contains("h help"));
+        assert!(sidebar_row(6).contains("WORKSPACES"));
+        assert!(sidebar_row(7).contains("▸ 1 spindle"));
+        assert!(rows.iter().position(|r| r.contains("AGENTS")).unwrap() > 7);
 
         let pane_row: String = rows[inner.y as usize]
             .chars()
@@ -531,6 +644,8 @@ mod tests {
         let (x, y) = find(&rows, "q quit");
         assert_eq!(key_at((x, y)), Some('q'));
         assert_eq!(key_at((x + 5, y)), Some('q'), "label");
+        let (x, y) = find(&rows, "h help");
+        assert_eq!(key_at((x, y)), Some('h'));
         assert_eq!(key_at(find(&rows, "^b")), None);
         assert_eq!(key_at(find(&rows, "WORKSPACES")), None);
     }
@@ -649,5 +764,104 @@ mod tests {
         let text: String = (0..10).map(|y| row(buf, y)).collect();
         assert!(text.contains("pwned"));
         assert!(!text.contains('\x1b') && !text.contains('\x07'), "{text:?}");
+    }
+
+    #[test]
+    fn help_lists_every_prefix_command() {
+        let listed: Vec<u8> = PREFIX_HELP
+            .iter()
+            .flat_map(|(keys, _)| keys.split(" / "))
+            .filter(|k| k.len() == 1)
+            .map(|k| k.as_bytes()[0])
+            .collect();
+        for key in &listed {
+            assert!(
+                crate::input::command(*key).is_some(),
+                "{} is listed but unbound",
+                *key as char
+            );
+        }
+        for key in b'!'..=b'~' {
+            if crate::input::command(key).is_some() && !key.is_ascii_digit() {
+                assert!(
+                    listed.contains(&key),
+                    "{} is bound but unlisted",
+                    key as char
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_overlays_the_view_with_the_configured_prefix() {
+        let mut terminal = Terminal::new(TestBackend::new(80, 30)).unwrap();
+        let prefix = crate::config::tests::prefix("C-a");
+        terminal
+            .draw(|f| {
+                draw(f, &sidebar(1), &[], &View::Shell);
+                draw_help(f, prefix);
+            })
+            .unwrap();
+        let rows: Vec<String> = (0..30)
+            .map(|y| row(terminal.backend().buffer(), y))
+            .collect();
+        println!("{}", rows.join("\n"));
+        let text = rows.join("\n");
+        assert!(text.contains("Ctrl-a, then:"));
+        assert!(text.contains("show this help"));
+        assert!(text.contains("In the review:"));
+        assert!(text.contains("any key closes"));
+
+        let mut tiny = Terminal::new(TestBackend::new(20, 5)).unwrap();
+        tiny.draw(|f| draw_help(f, prefix)).unwrap();
+    }
+
+    #[test]
+    fn help_swallows_what_closes_it() {
+        use crate::input::Mouse;
+        let mouse = |code, release| {
+            Action::Mouse(Mouse {
+                code,
+                col: 0,
+                row: 0,
+                release,
+            })
+        };
+        let (press, release, wheel) = (mouse(0, false), mouse(0, true), mouse(64, false));
+
+        let mut help = Help::Hidden;
+        assert!(!help.swallows(&press), "nothing to close");
+
+        // Opened from the menu: the click's release mustn't close it straight away.
+        help = Help::Shown;
+        assert!(help.swallows(&release));
+        assert!(help.swallows(&wheel));
+        assert!(help == Help::Shown);
+
+        assert!(help.swallows(&press));
+        assert!(help == Help::Closing);
+        assert!(help.swallows(&mouse(32, false)), "drag before the release");
+        assert!(help.swallows(&release));
+        assert!(help == Help::Hidden);
+        assert!(!help.swallows(&press));
+
+        help = Help::Shown;
+        assert!(help.swallows(&Action::Bytes(b"a".to_vec())));
+        assert!(help == Help::Hidden);
+
+        help = Help::Shown;
+        assert!(help.swallows(&Action::Help), "prefix-h again closes it");
+        assert!(help == Help::Hidden);
+
+        help = Help::Shown;
+        assert!(!help.swallows(&Action::NewWorkspace), "commands still run");
+        assert!(help == Help::Hidden);
+
+        help = Help::Closing;
+        assert!(
+            !help.swallows(&Action::Bytes(b"a".to_vec())),
+            "typing after a click"
+        );
+        assert!(help == Help::Hidden);
     }
 }

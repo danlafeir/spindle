@@ -17,6 +17,7 @@ pub enum Action {
     Mouse(Mouse),
     Quit,
     ToggleReview,
+    Help,
     NewWorkspace,
     Split(Axis),
     ClosePane,
@@ -111,6 +112,7 @@ pub fn command(key: u8) -> Option<Action> {
     match key {
         b'q' => Some(Action::Quit),
         b'g' => Some(Action::ToggleReview),
+        b'h' => Some(Action::Help),
         b'n' => Some(Action::NewWorkspace),
         b's' => Some(Action::Split(Axis::SideBySide)),
         b'S' => Some(Action::Split(Axis::Stacked)),

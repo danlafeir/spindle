@@ -23,6 +23,11 @@ impl Prefix {
         format!("^{}", self.letter())
     }
 
+    /// The long form shown in help, such as `Ctrl-b`.
+    pub fn name(self) -> String {
+        format!("Ctrl-{}", self.letter())
+    }
+
     fn letter(self) -> char {
         char::from(self.0 + b'a' - 1)
     }
@@ -114,6 +119,7 @@ pub mod tests {
         let config = load_str("prefix = \"C-a\"\n").unwrap();
         assert_eq!(config.prefix.byte(), 0x01);
         assert_eq!(config.prefix.caret(), "^a");
+        assert_eq!(config.prefix.name(), "Ctrl-a");
         assert_eq!(load_str("prefix = \"C-Z\"").unwrap().prefix.byte(), 0x1a);
         assert_eq!(load_str("").unwrap(), Config::default());
     }

@@ -107,6 +107,7 @@ fn run() -> Result<ExitCode> {
     });
 
     let mut view = ui::View::Shell;
+    let mut help = ui::Help::Hidden;
     let mut input = input::Input::new(config.prefix);
     let mut flush_at: Option<Instant> = None;
     let sidebar = |session: &Session| ui::Sidebar {
@@ -118,7 +119,12 @@ fn run() -> Result<ExitCode> {
     let mut dirty = true;
     loop {
         if dirty {
-            term.draw(|f| ui::draw(f, &sidebar(&session), &session.visible(), &view))?;
+            term.draw(|f| {
+                ui::draw(f, &sidebar(&session), &session.visible(), &view);
+                if help == ui::Help::Shown {
+                    ui::draw_help(f, config.prefix);
+                }
+            })?;
             dirty = false;
         }
         let mut event = match flush_at {
@@ -176,6 +182,9 @@ fn run() -> Result<ExitCode> {
             };
             let mut actions = VecDeque::from(keys);
             while let Some(action) = actions.pop_front() {
+                if help.swallows(&action) {
+                    continue;
+                }
                 // Pane and workspace commands act on the shells, so they bring them back into view.
                 let shows_panes = matches!(
                     action,
@@ -265,6 +274,7 @@ fn run() -> Result<ExitCode> {
                             _ => ui::View::Shell,
                         };
                     }
+                    input::Action::Help => help = ui::Help::Shown,
                     input::Action::NewWorkspace => {
                         if let Err(e) = session.new_workspace() {
                             view = ui::View::Unavailable(format!("Can't start a shell: {e:#}"));

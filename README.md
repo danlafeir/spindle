@@ -19,6 +19,7 @@ The prefix is `Ctrl-b` by default (see [Configuration](#configuration)), then:
 | arrows | Focus the pane in that direction |
 | `1`–`9` | Switch to that workspace |
 | `g` | Open or close the review view |
+| `h` | Show every command in an overlay; any key or click closes it |
 | `q` | Quit spindle (kills every shell) |
 | the prefix again | Send it to the shell as a literal key |
 
